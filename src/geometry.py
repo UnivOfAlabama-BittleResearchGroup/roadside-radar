@@ -1,9 +1,12 @@
+from functools import lru_cache
 from typing import List, Union
 import numpy as np
 import pandas as pd
 from shapely.geometry import Point, Polygon, LineString
 from shapely import affinity
 from shapely.ops import split
+from shapelysmooth import chaikin_smooth, taubin_smooth
+import polars as pl
 import geopandas as gpd
 import json
 
@@ -40,7 +43,6 @@ def load_centerlines(
 
 
 def get_radar_origins(path_2_origin_angles: str) -> gpd.GeoDataFrame:
-
     with open(path_2_origin_angles) as f:
         radar_info = pd.DataFrame(json.load(f)).T
 
@@ -67,7 +69,6 @@ def get_radar_fov(
     utm_crs = radar_info.crs
 
     if isinstance(radius, float):
-
         radar_info["radius"] = radius
     else:
         radar_info["radius"] = radar_info.index.map(radius)
@@ -120,3 +121,208 @@ def explode_linestring(
         .drop(columns=["geometry"])
         .set_crs(df.crs)
     )
+
+
+def redistribute_vertices(geom, distance):
+    # from https://gis.stackexchange.com/a/367965
+    if geom.geom_type == "LineString":
+        num_vert = int(round(geom.length / distance))
+        if num_vert == 0:
+            num_vert = 1
+        return LineString(
+            [
+                geom.interpolate(float(n) / num_vert, normalized=True)
+                for n in range(num_vert + 1)
+            ]
+        )
+    elif geom.geom_type == "MultiLineString":
+        parts = [redistribute_vertices(part, distance) for part in geom]
+        return type(geom)([p for p in parts if not p.is_empty])
+    else:
+        raise ValueError("unhandled geometry %s", (geom.geom_type,))
+
+
+class Lane:
+    def __init__(
+        self,
+        name: str,
+        linestring: LineString,
+        utm_crs: str,
+        crs: str,
+    ) -> None:
+        self.name = name
+        self.linestring = linestring
+        self._smoothed_linestring = None
+        self.utm_crs = utm_crs
+        self.crs = crs
+        self._fitted = False
+        self._fitted_pl_df = None
+
+    def __repr__(self) -> str:
+        return f"Lane({self.name})"
+
+    def __str__(self) -> str:
+        return f"Lane({self.name})"
+
+    def __eq__(self, o: object) -> bool:
+        return self.name == o.name
+
+    def __hash__(self) -> int:
+        return hash(self.name)
+
+    def fit(self, step_size: float = 0.1) -> "Lane":
+        smoothed_linestring = chaikin_smooth(
+            taubin_smooth(
+                self.linestring,
+            )
+        )
+        self._smoothed_linestring = redistribute_vertices(
+            smoothed_linestring, step_size
+        )
+        self._fitted = True
+
+        return self
+
+    @property
+    def df(self) -> pd.DataFrame:
+        if self._fitted_pl_df is None:
+            assert self._fitted, "Must fit the lane before accessing the dataframe"
+
+            angles = np.arctan2(
+                np.diff(self._smoothed_linestring.xy[1]),
+                np.diff(self._smoothed_linestring.xy[0]),
+            )
+
+            # calculate the distance between points
+            distances = np.sqrt(
+                np.diff(self._smoothed_linestring.xy[0]) ** 2
+                + np.diff(self._smoothed_linestring.xy[1]) ** 2
+            )
+
+            self._fitted_pl_df = pl.DataFrame(
+                {
+                    "x": np.array(self._smoothed_linestring.xy[0][:-1]),
+                    "y": np.array(self._smoothed_linestring.xy[1][:-1]),
+                    "s": np.cumsum(distances),
+                    "angle": angles,
+                }
+            )
+
+        return self._fitted_pl_df
+
+
+class RoadNetwork:
+    def __init__(
+        self, lane_gdf: gpd.GeoDataFrame, keep_lanes: List[str] = None
+    ) -> None:
+        assert "name" in lane_gdf.columns, "lane_gdf must have a 'name' column"
+
+        if keep_lanes is None:
+            keep_lanes = lane_gdf["name"].unique().tolist()
+
+        self.lane_gdf = (
+            lane_gdf.query("name in @keep_lanes")
+            .reset_index(drop=True)
+            .to_crs(lane_gdf.estimate_utm_crs())
+            .explode(index_parts=False)
+            .reset_index(drop=True)
+        )
+
+        self._utm_crs = self.lane_gdf.estimate_utm_crs()
+        self._crs = self.lane_gdf.crs
+
+        self._lanes = self._build_lanes()
+
+        self._pl_df = None
+        self._tree = None
+
+    def _build_lanes(self) -> List[Lane]:
+        return self.lane_gdf.apply(
+            lambda row: Lane(
+                name=row["name"],
+                linestring=row["geometry"],
+                crs=self._crs,
+                utm_crs=self._utm_crs,
+            ).fit(),
+            axis=1,
+        ).to_list()
+
+    def __repr__(self) -> str:
+        return f"RoadNetwork({[lane.name for lane in self._lanes]})"
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+    @property
+    def df(self) -> pd.DataFrame:
+        if self._pl_df is None:
+            self._pl_df = pl.concat(
+                lane.df.with_columns(
+                    pl.lit(lane.name).alias("name"),
+                )
+                for lane in self._lanes
+            ).with_row_count("lane_index")
+        return self._pl_df
+
+    def map_to_lane(
+        self,
+        df: pl.DataFrame,
+        directed: bool = True,
+        dist_upper_bound: float = 6,
+        utm_x_col: str = "utm_x",
+        utm_y_col: str = "utm_y",
+    ) -> pl.DataFrame:
+        from scipy.spatial import KDTree
+
+        # construct a kd tree
+        if self._tree is None:
+            self._tree = KDTree(
+                np.stack(
+                    [
+                        self.df["x"].to_numpy(),
+                        self.df["y"].to_numpy(),
+                    ],
+                    axis=1,
+                )
+            )
+
+        # query the kd tree
+        dist, idx = self._tree.query(
+            df[[utm_x_col, utm_y_col]].to_numpy(),
+            p=2,
+            distance_upper_bound=dist_upper_bound,
+        )
+
+        # assign a direction to the distance (i.e positive or negative)
+        df = (
+            df.with_columns(
+                lane_index=idx,
+                d=dist,
+            )
+            .with_columns(
+                pl.col("lane_index").cast(pl.UInt32),
+            )
+            .join(
+                self.df.rename({"x": "x_lane", "y": "y_lane"}),
+                on="lane_index",
+                how="left",
+                suffix="_lane",
+            )
+        )
+
+        if directed:
+            # calculate the clockwise angle between the lane and the vehicle
+            df = df.with_columns(
+                pl.when(
+                    pl.arctan2(
+                        pl.col(utm_y_col) - pl.col("y_lane"),
+                        pl.col(utm_x_col) - pl.col("x_lane"),
+                    )
+                    < 0,
+                )
+                .then(pl.col("d") * -1)
+                .otherwise(pl.col("d"))
+                .alias("d"),
+            )
+
+        return df

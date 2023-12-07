@@ -4,6 +4,9 @@ import torch
 from torch import FloatTensor
 import numpy as np
 import polars as pl
+
+# this is
+# ruff: noqa: F821
 from torchtyping import TensorType
 from tqdm import tqdm
 
@@ -39,8 +42,8 @@ def build_r_matrix() -> FloatTensor:
             [
                 [3, 0, 0, 0],
                 [0, 2, 0, 0],
-                [0, 0, 1.5, 0],
-                [0, 0, 0, 1.5],
+                [0, 0, 2, 0],
+                [0, 0, 0, 2],
             ]
         )
         ** 2,
@@ -59,34 +62,42 @@ def Q_white_noise(
 
     Q = torch.zeros(shape)
 
-    ws_sq = ws ** 2
-    wd_sq = wd ** 2
+    ws_sq = ws**2
+    wd_sq = wd**2
 
     # block build
     for offset, noise in [(0, ws_sq), (3, wd_sq)]:
-        Q[..., 0 + offset, 0 + offset] = 1 / 4 * dt ** 4 * noise
-        Q[..., 1 + offset, 0 + offset] = 1 / 2 * dt ** 3 * noise
-        Q[..., 2 + offset, 0 + offset] = 1 / 2 * dt ** 2 * noise
-        
-        Q[..., 0 + offset, 1 + offset] = 1 / 2 * dt ** 3 * noise
-        Q[..., 0 + offset, 2 + offset] = 1 / 2 * dt ** 2 * noise
-        
-        Q[..., 1 + offset, 1 + offset] = 1 * dt ** 2 * noise
+        Q[..., 0 + offset, 0 + offset] = 1 / 4 * dt**4 * noise
+        Q[..., 1 + offset, 0 + offset] = 1 / 2 * dt**3 * noise
+        Q[..., 2 + offset, 0 + offset] = 1 / 2 * dt**2 * noise
+
+        Q[..., 0 + offset, 1 + offset] = 1 / 2 * dt**3 * noise
+        Q[..., 0 + offset, 2 + offset] = 1 / 2 * dt**2 * noise
+
+        Q[..., 1 + offset, 1 + offset] = 1 * dt**2 * noise
         Q[..., 1 + offset, 2 + offset] = 1 * dt * noise
-        
+
         Q[..., 2 + offset, 1 + offset] = dt * noise
         Q[..., 2 + offset, 2 + offset] = 1 * noise
 
     return Q
 
 
-
+def _pick_device(gpu: bool = True) -> torch.device:
+    if not gpu:
+        return torch.device("cpu")
+    elif torch.cuda.is_available():
+        return torch.device("cuda")
+    elif torch.has_mps:
+        return torch.device("mps")
 
 
 class _VectorizedKalmanFilter:
     x_dim = 6
     z_dim = 4
-    
+
+    P_mod = 100
+
     w_s = 1
     w_d = 0.5
 
@@ -101,13 +112,8 @@ class _VectorizedKalmanFilter:
         inds: TensorType = None,
         gpu: bool = True,
     ) -> None:
-        
         if z is None:
-            self._device = (
-                torch.device("cuda")
-                if (torch.cuda.is_available() and gpu)
-                else torch.device("cpu")
-            )
+            self._device = _pick_device(gpu=gpu)
         else:
             self._device = z.device
 
@@ -140,16 +146,7 @@ class _VectorizedKalmanFilter:
                 (self.t_dim, self.v_dim, self.z_dim), device=self._device
             )
             self._z[self._inds[:, 0], self._inds[:, 1]] = torch.Tensor(
-                np.stack(
-                    df["z"]
-                    .fill_null(
-                        [
-                            0,
-                        ]
-                        * self.z_dim
-                    )
-                    .to_numpy()
-                ),
+                df["z"].to_numpy()
             ).to(self._device)
         else:
             # this is for IMM filter, where z can be shared across filters
@@ -157,13 +154,18 @@ class _VectorizedKalmanFilter:
 
         if predict_mask is None:
             # save where the all 0 as predictions are
-            self._predict_mask: TensorType["time", "vehicle",] = torch.zeros(
+            self._predict_mask: TensorType[
+                "time",
+                "vehicle",
+            ] = torch.zeros(
                 (self.t_dim, self.v_dim),
                 dtype=torch.bool,
                 device=self._device,
             )
             self._predict_mask[self._inds[:, 0], self._inds[:, 1]] = torch.BoolTensor(
-                ~df["missing_data"].to_numpy().copy(),
+                ~df["missing_data"].to_numpy(
+                    writable=True,
+                ),
             ).to(self._device)
         else:
             # this is for IMM filter, where predict_mask can be shared across filters
@@ -194,7 +196,9 @@ class _VectorizedKalmanFilter:
             (self.t_dim, self.v_dim, self.x_dim, self.x_dim), device=self._device
         )
         self._P[self._inds[:, 0], self._inds[:, 1]] = (
-            (torch.eye(self.x_dim) * 2).repeat(len(self._inds), 1, 1).to(self._device)
+            (torch.eye(self.x_dim) * self.P_mod)
+            .repeat(len(self._inds), 1, 1)
+            .to(self._device)
         )
 
         self._F: TensorType["vehicle", "x_dim", "x_dim"] = None
@@ -350,18 +354,16 @@ class _VectorizedKalmanFilter:
             self._x[t_ind, local_mask] + torch.matmul(K, y.unsqueeze(-1)).squeeze()
         )
 
-        self._P[t_ind, local_mask, :, :] = (
-            torch.matmul(
-                I_KH @ self._P[t_ind, local_mask],
-                I_KH.transpose(1, 2),
-            )
-            + torch.matmul(K, self.R) @ K.transpose(1, 2)
-        )
+        # Joseph form
+        self._P[t_ind, local_mask, :, :] = torch.matmul(
+            I_KH @ self._P[t_ind, local_mask],
+            I_KH.transpose(1, 2),
+        ) + torch.matmul(K, self.R) @ K.transpose(1, 2)
 
         self._update_t = t_ind
         self._S = (
             S.clone()
-        )  # I hate that this colors like a constant, but also like the capitalization
+        )  
         self._y = y.clone()
 
     def apply_filter(self, detach: bool = True) -> Tuple[np.ndarray, np.ndarray]:
@@ -446,8 +448,8 @@ class _VectorizedKalmanFilter:
 
 
 class CALKFilter(_VectorizedKalmanFilter):
-    w_s = 1
-    w_d = 0.1
+    w_s = 2
+    w_d = 1
 
     def __init__(
         self,
@@ -456,7 +458,7 @@ class CALKFilter(_VectorizedKalmanFilter):
         dt: TensorType = None,
         predict_mask: TensorType = None,
         inds: TensorType = None,
-        **kwargs
+        **kwargs,
     ) -> None:
         super().__init__(df, z, dt, predict_mask, inds, **kwargs)
 
@@ -467,7 +469,7 @@ class CALKFilter(_VectorizedKalmanFilter):
         F = torch.zeros(shape)
         F[..., 0, 0] = 1
         F[..., 0, 1] = dt_vect
-        F[..., 0, 2] = 0.5 * dt_vect ** 2
+        F[..., 0, 2] = 0.5 * dt_vect**2
 
         F[..., 1, 1] = 1
         F[..., 1, 2] = dt_vect
@@ -527,7 +529,6 @@ class CALKFilter(_VectorizedKalmanFilter):
         TensorType["time", "vehicle", "x_dim"],
         TensorType["time", "vehicle", "x_dim", "x_dim"],
     ]:
-
         if len(Xs) != len(Ps):
             raise ValueError("length of Xs and Ps must be the same")
 
@@ -539,7 +540,6 @@ class CALKFilter(_VectorizedKalmanFilter):
         # smoother gain
         out_Xs = Xs.unsqueeze(-1).clone()
         for k in tqdm(range(n - 2, -1, -1)):
-
             mask = dts[k + 1] > 0
 
             F_last = cls.F_static(dts[k + 1, mask], (mask.sum(), dim_x, dim_x)).to(
@@ -558,21 +558,10 @@ class CALKFilter(_VectorizedKalmanFilter):
 
         return out_Xs.squeeze(), Ps
 
-        # x, P, Pp = Xs.copy(), Ps.copy(), Ps.copy()
-        # for k in range(n-2, -1, -1):
-        #     Pp[k] = dot(dot(Fs[k+1], P[k]), Fs[k+1].T) + Qs[k+1]
-
-        #     #pylint: disable=bad-whitespace
-        #     K[k]  = dot(dot(P[k], Fs[k+1].T), inv(Pp[k]))
-        #     x[k] += dot(K[k], x[k+1] - dot(Fs[k+1], x[k]))
-        #     P[k] += dot(dot(K[k], P[k+1] - Pp[k]), K[k].T)
-
-        # return (x, P, K, Pp)
-
 
 class CVLKFilter(_VectorizedKalmanFilter):
-    w_s = 1
-    w_d = 0.1
+    w_s = 2
+    w_d = 1
 
     def __init__(
         self,
@@ -581,7 +570,7 @@ class CVLKFilter(_VectorizedKalmanFilter):
         dt: TensorType = None,
         predict_mask: TensorType = None,
         inds: TensorType = None,
-        **kwargs
+        **kwargs,
     ) -> None:
         super().__init__(df, z, dt, predict_mask, inds, **kwargs)
 
@@ -629,7 +618,7 @@ class CVLKFilter(_VectorizedKalmanFilter):
 
 
 class CALCFilter(_VectorizedKalmanFilter):
-    w_s = 1
+    w_s = 2
     w_d = 2
 
     def __init__(
@@ -682,7 +671,7 @@ class CALCFilter(_VectorizedKalmanFilter):
                 w_s,
                 0,
             )
-        
+
         Q = Q_white_noise(
             dt_vect,
             shape,
@@ -692,14 +681,6 @@ class CALCFilter(_VectorizedKalmanFilter):
 
         return Q
 
-        # Q = torch.zeros(shape)
-        # Q[..., 0, 0] =  0.5 * dt_vect ** 2 * w_s
-        # Q[..., 1, 0] =  dt_vect * w_s
-        # Q[..., 2, 0] =  w_s
-        # Q[..., 3, 0] =  0.5 * dt_vect ** 2 * CALCFilter.w_d
-        # Q[..., 4, 0] =  dt_vect * CALCFilter.w_d
-        # Q[..., 5, 0] =  CALCFilter.w_d
-        # return Q @ Q.transpose(-1, -2)
 
 class IMMFilter:
     def __init__(
@@ -741,6 +722,7 @@ class IMMFilter:
         self._mu: TensorType["time", "vehicle", "filter"] = torch.zeros(
             (self._filters[0].t_dim, self._filters[0].v_dim, self.f_dim),
             device=self._device,
+            dtype=torch.float32,
         )
         self._mu[0, :, :] = torch.from_numpy(mu.astype(np.float32)).to(self._device)
 
@@ -762,6 +744,7 @@ class IMMFilter:
         self._omega: TensorType["time", "vehicle", "filter", "filter"] = torch.zeros(
             (self._filters[0].t_dim, self._filters[0].v_dim, self.f_dim, self.f_dim),
             device=self._device,
+            dtype=torch.float32,
         )
 
         # initalize cbar
@@ -772,23 +755,30 @@ class IMMFilter:
         self._x = torch.zeros(
             (self.t_dim, self.v_dim, self.x_dim),
             device=self._device,
+            dtype=torch.float32,
         )
 
         self._P = torch.zeros(
             (self.t_dim, self.v_dim, self.x_dim, self.x_dim),
             device=self._device,
+            dtype=torch.float32,
         )
 
-        # add a prediction mask. 
+        # add a prediction mask.
         # This is different than the filter's predict mask, as it indicates that lane-change predictions are not allowed
         self._predict_mask = torch.zeros(
-            (self.t_dim, self.v_dim, ),
+            (
+                self.t_dim,
+                self.v_dim,
+            ),
             device=self._device,
             dtype=torch.bool,
         )
 
-        self._predict_mask[self._filters[0].inds[:, 0], self._filters[0].inds[:, 1]] = torch.BoolTensor(
-            df["prediction"].to_numpy().copy(),
+        self._predict_mask[
+            self._filters[0].inds[:, 0], self._filters[0].inds[:, 1]
+        ] = torch.BoolTensor(
+            df["prediction"].to_numpy(writable=True),
         ).to(self._device)
 
         self._compute_state_estimate(0)
@@ -833,19 +823,6 @@ class IMMFilter:
         self._omega[t_ind] = omega / omega.sum(dim=-1, keepdim=True)
 
     def _compute_state_estimate(self, t_ind: int) -> None:
-        # try the combining the FilterPy way
-        # self._x[t_ind].fill_(0.)
-        # for j in range(self.f_dim):
-        #     self._x[t_ind] += self._filters[j].x[t_ind] * self._mu[t_ind, :, j, None]
-
-        # self._P[t_ind].fill_(0.)
-        # for j in range(self.f_dim):
-        #     y = self._filters[j].x[t_ind] - self._x[t_ind]
-        #     outer_y = y[:,  :, None] @ y[:,  None,:]
-        #     self._P[t_ind] += self._mu[t_ind, :, j, None, None] * (
-        #         outer_y + self._filters[j].P[t_ind]
-        #     )
-
         # compute the mixed state estimate
         all_x = self.filter_x(t_ind)
         all_P = self.filter_P(t_ind)
@@ -865,43 +842,8 @@ class IMMFilter:
             outer + all_P,
         )
 
-        # checked off
-        # assert torch.allclose(test_x, self._x[t_ind])
-        # assert torch.allclose(test_P, self._P[t_ind])
-
     def predict(self, t_ind: int) -> None:
-        # t_ind_l = max(t_ind - 1, 0)
-        # # do it FilterPy way
-        # xs, Ps = [], []
-        # for i in range(self.f_dim):
-        #     x = torch.zeros_like(self._x[t_ind_l])
-        #     for j in range(self.f_dim):
-        #         x += self._filters[j].x[t_ind_l] * self._omega[t_ind_l, :, i, j, None]
-        #     xs.append(x)
-
-        #     P = torch.zeros_like(self._P[t_ind_l])
-        #     for j in range(self.f_dim):
-        #         y = self._filters[j].x[t_ind_l] - x
-        #         outer_y = y[:, :, None] @ y[:, None, :]
-        #         P += self._omega[t_ind_l, :, i, j, None, None] * (
-        #             outer_y + self._filters[j].P[t_ind_l]
-        #         )
-        #     Ps.append(P)
-
         self._predict_vectorized(t_ind)
-
-        # for i in range(self.f_dim):
-        #     self._filters[i].predict(t_ind, x=xs[i], P=Ps[i])
-
-        # make sure that allclose for all filters
-        # try:
-        # for i in range(self.f_dim):
-        #     assert torch.allclose(x_pred[:, i], self._filters[i].x[t_ind])
-        #     assert torch.allclose(p_pred[:, i], self._filters[i].P[t_ind])
-        # except AssertionError as e:
-        #     pass
-
-        # compute the state estimate
         self._compute_state_estimate(t_ind)
 
     def _predict_vectorized(self, t_ind: int) -> None:
@@ -961,11 +903,9 @@ class IMMFilter:
         # so have to use the last time step
         self._mu[t_ind, mask] = likelihoods * self.cbar(max(t_ind - 1, 0))[mask]
         self._mu[t_ind, ~mask] = self._mu[max(t_ind - 1, 0), ~mask]
-        
+
         self._mu[t_ind, self._predict_mask[t_ind], 0] = 0
-        self._mu[t_ind, ] = self._mu[t_ind, ] / self._mu[t_ind, ].sum(
-            dim=1, keepdim=True
-        )
+        self._mu[t_ind,] = self._mu[t_ind,] / self._mu[t_ind,].sum(dim=1, keepdim=True)
 
         # compute the mixing probabilities
         self._compute_mixing_probabilities(t_ind)
@@ -987,25 +927,28 @@ class IMMFilter:
         P = self.filter_P(t_ind)[local_mask]
         H = self.filter_H()
         R = self.filter_R()
-        I = self.filter_I()
+        I = self.filter_I()  # noqa: E741
 
         y = z[:, None, :] - (H @ x.unsqueeze(-1)).squeeze()
 
         PHT = P @ H.transpose(-1, -2)
         S = H @ PHT + R
-        SI = torch.inverse(S)
+        try:
+            SI = torch.inverse(
+                S,
+            )
+        except RuntimeError as e:
+            print(f"pinverse failed at time {t_ind}")
+            raise e
         K = PHT @ SI
         I_KH = I - K @ H
 
         x = x + torch.matmul(K, y.unsqueeze(-1)).squeeze()
 
-        P = (
-            torch.matmul(
-                I_KH @ P,
-                I_KH.transpose(-1, -2),
-            )
-            + torch.matmul(K, R) @ K.transpose(-1, -2)
-        )
+        P = torch.matmul(
+            I_KH @ P,
+            I_KH.transpose(-1, -2),
+        ) + torch.matmul(K, R) @ K.transpose(-1, -2)
 
         for i, f in enumerate(self._filters):
             f.x[t_ind, local_mask] = x[:, i].clone()
@@ -1019,7 +962,13 @@ class IMMFilter:
         S: TensorType["filt", "masked_vehicle", "x_dim", "x_dim"],
     ) -> TensorType["filt", "masked_vehicle"]:
         # https://gregorygundersen.com/blog/2019/10/30/scipy-multivariate/
-        vals, vecs = torch.linalg.eigh(S)
+
+        try:
+            vals, vecs = torch.linalg.eigh(S)
+        except RuntimeError as e:
+            print(f"eigh failed")
+            raise e
+
         logdet = torch.log(vals).sum(
             axis=-1,
         )
@@ -1085,10 +1034,11 @@ def batch_imm_df(
     filts = []
 
     # chunk the filters
-    for chunk_df in tqdm(df.with_columns(
-        (pl.col("vehicle_ind") // chunk_size).alias("chunk")
-    ).partition_by("chunk")):
-
+    for chunk_df in tqdm(
+        df.with_columns(
+            (pl.col("vehicle_ind") // chunk_size).alias("chunk")
+        ).partition_by("chunk")
+    ):
         offset = chunk_df["vehicle_ind"].min()
 
         imm = IMMFilter(

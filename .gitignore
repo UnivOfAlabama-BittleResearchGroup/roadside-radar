@@ -1,3 +1,10 @@
+# data
+data/raw
+.DS_Store
+
+# Vscode
+.vscode/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

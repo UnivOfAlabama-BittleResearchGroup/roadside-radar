@@ -3,7 +3,7 @@ from typing import Dict, List, Set, Tuple, TYPE_CHECKING
 import numpy as np
 import polars as pl
 import h3.api.numpy_int as h3
-import json
+import yaml
 import utm
 from shapely.geometry import Polygon
 import math
@@ -126,7 +126,7 @@ class BasicRadar:
         radius = radius or cls.crop_radius_m
         return df.filter(
             (pl.col("f32_positionX_m") ** 2 + pl.col("f32_positionY_m") ** 2)
-            <= (radius ** 2)
+            <= (radius**2)
         )
 
     @classmethod
@@ -139,26 +139,13 @@ class BasicRadar:
             df.sort(["object_id", "epoch_time"])
             .with_columns(
                 [
-                    ((pl.col("ui16_ageCount").diff() == 0))
+                    (pl.col("ui16_ageCount").diff() == 0)
                     .over("object_id")
                     .alias("duplicate")
                 ]
             )
-            # .with_columns(
-            #     [
-            #         (pl.col("duplicate") | pl.col("duplicate").shift(2))
-            #         .over("object_id")
-            #         .alias("duplicate")
-            #     ]
-            # )
             .filter(~pl.col("duplicate"))
             .drop("duplicate")
-            # .with_columns(
-            #     [pl.col(c).interpolate().over("object_id").alias(c) for c in float_cols]
-            # )
-            # .filter(
-            #     pl.col("f32_velocityInDir_mps").is_not_null()
-            # )
         )
 
     @classmethod
@@ -211,42 +198,6 @@ class BasicRadar:
 
     @classmethod
     @timeit
-    def clip_trajectory_end(cls, df: pl.DataFrame) -> pl.DataFrame:
-        return (
-            df.sort("epoch_time")
-            .with_columns(
-                [
-                    (
-                        (
-                            pl.col("f32_velocityInDir_mps").diff().abs() < 0.001
-                        ).fill_null(True)
-                        & (pl.col("f32_velocityInDir_mps") > 0)
-                    )
-                    .over("object_id")
-                    .alias("stopped"),
-                ]
-            )
-            .with_columns(
-                [
-                    (~pl.col("stopped"))
-                    .cast(pl.Int8())
-                    .cumsum()
-                    .over("object_id")
-                    .alias("stopped_count")
-                ]
-            )
-            .with_columns(
-                (pl.col("stopped_count") >= pl.col("stopped_count").max())
-                .over("object_id")
-                .alias("trim")
-            )
-            .filter(~pl.col("trim"))
-            .sort(["object_id", "epoch_time"])
-            .drop(["stopped", "stopped_count", "trim"])
-        )
-
-    @classmethod
-    @timeit
     def filter_short_trajectories(
         cls,
         df: pl.DataFrame,
@@ -292,23 +243,15 @@ class BasicRadar:
                 by=["object_id"],
                 check_sorted=False,
             )
-            # .groupby_dynamic(
-            #     index_column="epoch_time",
-            #     every=f"{resample_interval_ms}ms",
-            #     by=["object_id"],
-            # )
             .agg(
                 [
                     pl.col(pl.FLOAT_DTYPES).mean(),
-                    # pl.col(pl.FLOAT_DTYPES).interpolate(),
                     *(
                         pl.col(type_).first()
-                        # pl.col(type_).forward_fill()
                         for type_ in [pl.INTEGER_DTYPES, pl.Utf8, pl.Boolean]
                     ),
                 ]
             )
-            # .pipe(safe_lazy)
         )
 
     @classmethod
@@ -404,24 +347,27 @@ class BasicRadar:
     def rotate_radars(
         cls, df: pl.DataFrame, angle_mapping: Dict[str, float] = None
     ) -> pl.DataFrame:
-        return (
-            df.with_columns(
-                [pl.col("ip").map_dict(angle_mapping).alias("rotation_angle")]
-            )
-            .with_columns(
-                [
-                    (
-                        pl.col("f32_positionX_m") * pl.col("rotation_angle").cos()
-                        - pl.col("f32_positionY_m") * pl.col("rotation_angle").sin()
-                    ).alias("rotated_x"),
-                    (
-                        pl.col("f32_positionX_m") * pl.col("rotation_angle").sin()
-                        + pl.col("f32_positionY_m") * pl.col("rotation_angle").cos()
-                    ).alias("rotated_y"),
-                ]
-            )
-            .drop(["rotation_angle"])
+        df = df.with_columns(
+            [pl.col("ip").map_dict(angle_mapping).alias("rotation_angle")]
+        ).with_columns(
+            [
+                (
+                    pl.col("f32_positionX_m") * pl.col("rotation_angle").cos()
+                    - pl.col("f32_positionY_m") * pl.col("rotation_angle").sin()
+                ).alias("rotated_x"),
+                (
+                    pl.col("f32_positionX_m") * pl.col("rotation_angle").sin()
+                    + pl.col("f32_positionY_m") * pl.col("rotation_angle").cos()
+                ).alias("rotated_y"),
+            ]
         )
+
+        if "heading" in df.columns:
+            df = df.with_columns(
+                (pl.col("rotation_angle") + pl.col("heading")).alias("heading_utm")
+            )
+
+        return df.drop(["rotation_angle"])
 
     @classmethod
     @timeit
@@ -465,7 +411,6 @@ class BasicRadar:
         # https://stackoverflow.com/a/16544330
         # dot = x1*x2 + y1*y2      # Dot product between [x1, y1] and [x2, y2]
         # det = x1*y2 - y1*x2      # Determinant
-        # angle = atan2(det, dot)
         return (
             df.with_columns(
                 [
@@ -488,12 +433,7 @@ class BasicRadar:
                     ).alias("cross"),
                 ]
             )
-            .pipe(
-                cls.atan2,
-                "dot",
-                "cross",
-                "angle_d",
-            )
+            .with_columns(pl.atan2(pl.col("cross"), pl.col("dot")).alias("angle_d"))
             .with_columns(
                 [
                     pl.when(pl.col("angle_d") > np.pi)
@@ -680,10 +620,7 @@ class BasicRadar:
             .with_columns(
                 [
                     # cast s to int
-                    pl.col("s")
-                    .round()
-                    .cast(pl.Int32)
-                    .alias("s_int"),
+                    pl.col("s").round().cast(pl.Int32).alias("s_int"),
                 ]
             )
             .groupby(["ip", "lane", "s_int"])
@@ -746,52 +683,6 @@ class BasicRadar:
             ]
         )
 
-    @classmethod
-    @timeit
-    def atan2(
-        cls,
-        df: pl.DataFrame,
-        x_col: str,
-        y_col: str,
-        out_col: str,
-        normalize: bool = True,
-    ) -> pl.DataFrame:
-        df = df.with_columns(
-            (
-                (
-                    (
-                        pl.when(
-                            pl.col(x_col) > 0,
-                        )
-                        .then((pl.col(y_col) / pl.col(x_col)).arctan())
-                        .when(
-                            pl.col(x_col) < 0,
-                        )
-                        .then(
-                            pl.when(
-                                pl.col(y_col) >= 0,
-                            )
-                            .then((pl.col(y_col) / pl.col(x_col)).arctan() + np.pi)
-                            .otherwise((pl.col(y_col) / pl.col(x_col)).arctan() - np.pi)
-                        )
-                        .otherwise(
-                            pl.when(
-                                pl.col(y_col) > 0,
-                            )
-                            .then(np.pi / 2)
-                            .otherwise(-np.pi / 2)
-                        )
-                    )
-                )
-            ).alias(out_col)
-        )
-
-        return (
-            df.with_columns([((pl.col(out_col) + np.pi) % (2 * np.pi)).alias(out_col)])
-            if normalize
-            else df
-        )
-
     @timeit
     def correct_center(
         cls,
@@ -813,12 +704,58 @@ class BasicRadar:
             ]
         )
 
+    @classmethod
+    @timeit
+    def add_heading(
+        cls,
+        df: pl.DataFrame,
+    ) -> pl.DataFrame:
+        return df.with_columns(
+            pl.arctan2(pl.col("f32_directionY"), pl.col("f32_directionX")).alias(
+                "heading"
+            )
+        )
 
-class Filtering(BasicRadar):
+    @classmethod
+    @timeit
+    def clip_trajectory_end(
+        cls,
+        df: pl.DataFrame,
+    ) -> pl.DataFrame:
+        return (
+            df.with_columns(
+                [
+                    # Trim off the ends of trajectoriers where the radar has done predictions.
+                    # This can be done by reversing the cummulative count of predictions and comparing to the reverse cummulative count
+                    # They are equal until the last measure data point
+                    (
+                        pl.col("ui16_predictionCount").count()
+                        - pl.col("ui16_predictionCount").cumcount()
+                    )
+                    .over("object_id")
+                    .alias("cumcount"),
+                    (pl.col("ui16_predictionCount") > 0)
+                    .reverse()
+                    .cumsum()
+                    .reverse()
+                    .over("object_id")
+                    .alias("reverse_cumcount"),
+                ]
+            )
+            .with_columns(
+                [
+                    (pl.col("cumcount") != pl.col("reverse_cumcount")).alias("keep"),
+                ]
+            )
+            .filter(pl.col("keep"))
+            .drop(["keep", "cumcount", "reverse_cumcount"])
+        )
+
+
+class CalibratedRadar(BasicRadar):
     def __init__(
         self,
         radar_location_path: str,
-        network_boundary_path: str,
         # overlap_zone_path: str,
     ) -> None:
         super().__init__()
@@ -831,16 +768,19 @@ class Filtering(BasicRadar):
             self.rotations,
         ) = self._read_radar_locations(radar_location_path)
 
-        self.network_boundary = self._read_network_boundary(network_boundary_path)
-
     @staticmethod
     def _read_radar_locations(path) -> Tuple[dict, Tuple]:
         with open(path, "r") as f:
-            radar_locations = json.load(f)
+            radar_locations = yaml.safe_load(f)
+
+        def _convert_latlon(origin_tuple):
+            try:
+                return utm.from_latlon(*origin_tuple)
+            except utm.OutOfRangeError:
+                return utm.from_latlon(*origin_tuple)
 
         radar_utms = {
-            ip: utm.from_latlon(*radar_locations[ip]["origin"][::-1])
-            for ip in radar_locations
+            ip: _convert_latlon(radar_locations[ip]["origin"]) for ip in radar_locations
         }
 
         radar_rotations = {
@@ -852,32 +792,21 @@ class Filtering(BasicRadar):
 
         return radar_utms, list(radar_utms.values())[0][2:4], radar_rotations
 
-    def _read_network_boundary(self, path) -> Set[str]:
-        # open the network boundary shapefile with g
-        with open(path, "r") as f:
-            json_data = json.load(f)
-
-        ls = Polygon(json_data["features"][0]["geometry"]["coordinates"][0])
-
-        return h3.polyfill_polygon(
-            ls.exterior.coords,
-            self.h3_resolution,
-            lnglat_order=True,
-        )
-
     @timeit
     def rotate_heading(self, df: pl.DataFrame) -> pl.DataFrame:
         return (
             # do this faster
             df.lazy()
-            .pipe(self.atan2, "f32_directionX", "f32_directionY", "arctan2")
             .with_columns(
+                pl.atan2(pl.col("f32_directionX"), pl.col("f32_directionY")).alias(
+                    "arctan2"
+                ),
                 pl.col("ip").map_dict(self.rotations).alias("rotation"),
             )
             .with_columns(
                 [
                     (
-                        ((pl.col("arctan2") + pl.col("rotation") + np.pi) % (2 * np.pi))
+                        (pl.col("arctan2") + pl.col("rotation") + np.pi) % (2 * np.pi)
                     ).alias("direction"),
                 ]
             )
@@ -897,7 +826,9 @@ class Filtering(BasicRadar):
             rotations,
         )
 
-    def update_origin(self, df: pl.DataFrame, locations: Dict[str, Tuple[float]] = None) -> pl.DataFrame:
+    def update_origin(
+        self, df: pl.DataFrame, locations: Dict[str, Tuple[float]] = None
+    ) -> pl.DataFrame:
         locations = locations or self.radar_locations
         return df.pipe(super().update_origin, locations)
 
