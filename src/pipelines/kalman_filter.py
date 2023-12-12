@@ -1,41 +1,6 @@
-from datetime import timedelta
 import numpy as np
 import polars as pl
-
-from src.radar import BasicRadar, CalibratedRadar
-from src.filters.vectorized_kalman import IMMFilter
-
-
-def timeit(func):
-    def timed(*args, **kwargs):
-        import time
-
-        start_time = time.time()
-        result = func(*args, **kwargs)
-        end_time = time.time()
-
-        print(
-            "function: {} took: {} seconds".format(func.__name__, end_time - start_time)
-        )
-
-        return result
-
-    return timed
-
-
-def lazify(func):
-    # if the input is a lazy frame, then return a lazy frame
-    # otherwise return a regular frame
-    def lazy_func(*args, **kwargs):
-        if isinstance(args[0], pl.LazyFrame):
-            res = func(*args, **kwargs)
-            if isinstance(res, pl.DataFrame):
-                return res.lazy()
-            return res
-        else:
-            return func(*args, **kwargs)
-
-    return lazy_func
+from src.pipelines.utils import lazify, timeit
 
 
 @lazify
@@ -105,12 +70,6 @@ def prepare_frenet_measurement(
             (pl.col("f32_velocityInDir_mps") * pl.col("angle_diff").sin()).alias(
                 "d_velocity"
             ),
-            # (pl.col("f32_velocityInDir_mps")).alias(
-            #     "s_velocity"
-            # ),
-            # (pl.lit(0)).alias(
-            #     "d_velocity"
-            # ),
         )
         .with_columns(
             [
@@ -169,7 +128,7 @@ def build_extension(
 
     test = (
         df.lazy()
-        .group_by("object_id")
+        .group_by(["object_id", "lane"])
         .agg(
             pl.col("epoch_time").min(),
             pl.col("epoch_time").max().alias("max_time"),
@@ -190,7 +149,7 @@ def build_extension(
         .explode("dt")
         .with_columns(
             (
-                pl.col("dt").cumsum().over("object_id") * 1e3
+                pl.col("dt").cumsum().over(["object_id", "lane"]) * 1e3
                 + pl.col("epoch_time").cast(float)
             )
             .cast(time_dt)
@@ -200,18 +159,20 @@ def build_extension(
         .drop(["dt", "n_steps", "total_duration_ms", "max_time"])
         .join(
             df.with_columns(pl.lit(False).alias("missing_data")),
-            on=["object_id", "epoch_time"],
-            how="left",
+            on=["object_id", "epoch_time", "lane"],
+            how="outer",
         )
-        .sort(by=["object_id", "epoch_time"])
+        .sort(by=["object_id", "lane", "epoch_time"])
         .with_columns(
             pl.col("missing_data").fill_null(True),
             pl.col("prediction").fill_null(False),
         )
-        .with_columns(pl.col(set(df.columns) - {"prediction"}).forward_fill())
+        .with_columns(
+            pl.col(set(df.columns) - {"prediction", "missing_data"}).forward_fill()
+        )
         .collect()
         .rechunk()
-        .set_sorted(["object_id", "epoch_time"])
+        .set_sorted(["object_id", "lane", "epoch_time"])
         .lazy()
     )
 
@@ -304,4 +265,35 @@ def build_kalman_df(
 
     return kalman_df.sort(by=["vehicle_ind", "time_ind"]).with_columns(
         pl.col("vehicle_ind").cast(int)
+    )
+
+
+@lazify
+@timeit
+def join_results(
+    df: pl.DataFrame,
+    kalman_df: pl.DataFrame,
+    radar_df: pl.DataFrame,
+) -> pl.DataFrame:
+    radar_df_keep_cols = list(
+        set(radar_df.columns) - set(df.columns) - set(kalman_df.columns)
+    )
+    radar_df_keep_cols.sort()
+
+    return (
+        df.lazy()
+        .with_columns(pl.col(["time_ind", "vehicle_ind"]).cast(int))
+        .join(
+            kalman_df.lazy().with_columns(
+                pl.col(["time_ind", "vehicle_ind"]).cast(int)
+            ),
+            on=["time_ind", "vehicle_ind"],
+            how="inner",
+        )
+        .drop(["time_ind", "vehicle_ind"])
+        .join(
+            radar_df.lazy().select(radar_df_keep_cols + ["epoch_time", "kalman_id"]),
+            on=["kalman_id", "epoch_time"],
+            how="left",
+        )
     )

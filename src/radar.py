@@ -102,12 +102,14 @@ class BasicRadar:
     def add_cst_timezone(
         cls,
         df: pl.DataFrame,
+        time_col: str = "epoch_time",
+        cst_col: str = "epoch_time_cst",
     ) -> pl.DataFrame:
         return df.with_columns(
             [
-                pl.col("epoch_time")
+                pl.col(time_col)
                 .dt.convert_time_zone("US/Central")
-                .alias("epoch_time_cst")
+                .alias(cst_col)
             ]
         )
 
@@ -776,8 +778,8 @@ class CalibratedRadar(BasicRadar):
         def _convert_latlon(origin_tuple):
             try:
                 return utm.from_latlon(*origin_tuple)
-            except utm.OutOfRangeError:
-                return utm.from_latlon(*origin_tuple)
+            except Exception:
+                return utm.from_latlon(*origin_tuple[::-1])
 
         radar_utms = {
             ip: _convert_latlon(radar_locations[ip]["origin"]) for ip in radar_locations

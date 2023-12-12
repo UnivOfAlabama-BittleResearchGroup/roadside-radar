@@ -29,7 +29,7 @@ def build_h_matrix() -> FloatTensor:
                 [0, 0, 0, 1, 0, 0],
                 [0, 0, 0, 0, 1, 0],
             ]
-        )
+        ),
     )
 
 
@@ -83,7 +83,7 @@ def Q_white_noise(
     return Q
 
 
-def _pick_device(gpu: bool = True) -> torch.device:
+def pick_device(gpu: bool = True) -> torch.device:
     if not gpu:
         return torch.device("cpu")
     elif torch.cuda.is_available():
@@ -96,7 +96,7 @@ class _VectorizedKalmanFilter:
     x_dim = 6
     z_dim = 4
 
-    P_mod = 100
+    P_mod = 2
 
     w_s = 1
     w_d = 0.5
@@ -113,7 +113,7 @@ class _VectorizedKalmanFilter:
         gpu: bool = True,
     ) -> None:
         if z is None:
-            self._device = _pick_device(gpu=gpu)
+            self._device = pick_device(gpu=gpu)
         else:
             self._device = z.device
 
@@ -146,7 +146,7 @@ class _VectorizedKalmanFilter:
                 (self.t_dim, self.v_dim, self.z_dim), device=self._device
             )
             self._z[self._inds[:, 0], self._inds[:, 1]] = torch.Tensor(
-                df["z"].to_numpy()
+                df["z"].to_numpy(writable=True)
             ).to(self._device)
         else:
             # this is for IMM filter, where z can be shared across filters
@@ -446,6 +446,46 @@ class _VectorizedKalmanFilter:
         # clear the cache
         torch.cuda.empty_cache()
 
+    @classmethod
+    def rts_smoother(
+        cls,
+        Xs: TensorType["time", "vehicle", "x_dim"],
+        Ps: TensorType["time", "vehicle", "x_dim", "x_dim"],
+        dts: TensorType["time", "vehicle"],
+        device: torch.device = None,
+    ) -> Tuple[
+        TensorType["time", "vehicle", "x_dim"],
+        TensorType["time", "vehicle", "x_dim", "x_dim"],
+    ]:
+        if len(Xs) != len(Ps):
+            raise ValueError("length of Xs and Ps must be the same")
+
+        n, v_dim, dim_x = Xs.shape
+
+        if device is None:
+            device = Xs.device
+
+        # smoother gain
+        out_Xs = Xs.unsqueeze(-1).clone()
+        for k in tqdm(range(n - 2, -1, -1)):
+            mask = dts[k + 1] > 0
+
+            F_last = cls.F_static(dts[k + 1, mask], (mask.sum(), dim_x, dim_x)).to(
+                device
+            )
+            Q_last = cls.Q_static(
+                dts[k + 1, mask], (mask.sum(), dim_x, dim_x), Xs[k + 1, mask, 0]
+            ).to(device)
+
+            Pp = F_last @ Ps[k, mask] @ F_last.transpose(-1, -2) + Q_last
+
+            K = Ps[k, mask] @ F_last.transpose(-1, -2) @ torch.linalg.pinv(Pp)
+
+            out_Xs[k, mask] += K @ (out_Xs[k + 1, mask] - F_last @ out_Xs[k, mask])
+            Ps[k, mask] += K @ (Ps[k + 1, mask] - Pp) @ K.transpose(-1, -2)
+
+        return out_Xs.squeeze(), Ps
+
 
 class CALKFilter(_VectorizedKalmanFilter):
     w_s = 2
@@ -632,27 +672,38 @@ class CALCFilter(_VectorizedKalmanFilter):
     ) -> None:
         super().__init__(df, z, dt, predict_mask, inds, **kwargs)
 
-    def F(self, t_ind: int) -> TensorType["vehicle", "x_dim", "x_dim"]:
-        F = torch.zeros((self.v_dim, self.x_dim, self.x_dim), device=self._dt.device)
+    @staticmethod
+    def F_static(
+        dt_vect: int, shape: Tuple[int, ...]
+    ) -> TensorType["vehicle", "x_dim", "x_dim"]:
+        F = torch.zeros(shape)
+        
+        F[..., 0, 0] = 1
+        F[..., 0, 1] = dt_vect
+        F[..., 0, 2] = 0.5 * dt_vect**2
 
-        F[:, 0, 0] = 1
-        F[:, 0, 1] = self._dt[t_ind]
-        F[:, 0, 2] = 0.5 * self._dt[t_ind] ** 2
+        F[..., 1, 1] = 1
+        F[..., 1, 2] = dt_vect
 
-        F[:, 1, 1] = 1
-        F[:, 1, 2] = self._dt[t_ind]
+        F[..., 2, 2] = 1
 
-        F[:, 2, 2] = 1
+        F[..., 3, 3] = 1
+        F[..., 3, 4] = dt_vect
+        F[..., 3, 5] = 0.5 * dt_vect ** 2
 
-        F[:, 3, 3] = 1
-        F[:, 3, 4] = self._dt[t_ind]
-        F[:, 3, 5] = 0.5 * self._dt[t_ind] ** 2
+        F[..., 4, 4] = 1
+        F[..., 4, 5] = dt_vect
 
-        F[:, 4, 4] = 1
-        F[:, 4, 5] = self._dt[t_ind]
+        F[..., 5, 5] = 1
 
-        F[:, 5, 5] = 1
         return F
+
+    def F(self, t_ind: int) -> TensorType["vehicle", "x_dim", "x_dim"]:
+        return self.F_static(
+            self._dt[t_ind],
+            (self.v_dim, self.x_dim, self.x_dim),
+        ).to(self._device)
+    
 
     @classmethod
     def Q_static(
