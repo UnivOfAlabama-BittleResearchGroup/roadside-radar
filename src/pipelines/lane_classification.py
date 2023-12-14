@@ -18,44 +18,44 @@ def label_lane(
     left_lane_center_wb = right_lane_center - lane_width
     left_lane_center_eb = right_lane_center + lane_width 
     return df.with_columns(
-        pl.when(pl.col("lane").str.contains("W"))
-        .then(
-            pl.when(
-                pl.col("d").is_between(
-                    right_lane_center - half_lane_width,
-                    right_lane_center + half_lane_width,
-                )
-            )
-            .then(0)
-            .otherwise(
-                pl.when(
-                    pl.col("d").is_between(
-                        left_lane_center_wb - half_lane_width,
-                        left_lane_center_wb + half_lane_width,
-                    )
-                )
-                .then(1)
-                .otherwise(None)
+        # pl.when(pl.col("lane").str.contains("W"))
+        # .then(
+        pl.when(
+            pl.col("d").is_between(
+                right_lane_center - half_lane_width,
+                right_lane_center + half_lane_width,
             )
         )
+        .then(0)
         .otherwise(
             pl.when(
                 pl.col("d").is_between(
-                    right_lane_center - half_lane_width,
-                    right_lane_center + half_lane_width,
+                    left_lane_center_eb - half_lane_width,
+                    left_lane_center_eb + half_lane_width,
                 )
             )
-            .then(0)
-            .otherwise(
-                pl.when(
-                    pl.col("d").is_between(
-                        left_lane_center_eb - half_lane_width,
-                        left_lane_center_eb + half_lane_width,
-                    )
-                )
-                .then(1)
-                .otherwise(None)
-            )
-        )
-        .alias("lane_index")
+            .then(1)
+            .otherwise(None)
+        ).alias("lane_index")
+        
+        # .otherwise(
+        #     pl.when(
+        #         pl.col("d").is_between(
+        #             right_lane_center - half_lane_width,
+        #             right_lane_center + half_lane_width,
+        #         )
+        #     )
+        #     .then(0)
+        #     .otherwise(
+        #         pl.when(
+        #             pl.col("d").is_between(
+        #                 left_lane_center_eb - half_lane_width,
+        #                 left_lane_center_eb + half_lane_width,
+        #             )
+        #         )
+        #         .then(1)
+        #         .otherwise(None)
+        #     )
+        # )
+        # .alias("lane_index")
     )

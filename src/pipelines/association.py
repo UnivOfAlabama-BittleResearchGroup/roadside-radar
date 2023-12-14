@@ -1,3 +1,4 @@
+from datetime import timedelta
 import numpy as np
 import polars as pl
 from src.filters.fusion import association_loglikelihood_distance
@@ -12,9 +13,24 @@ def add_front_back_s(df: pl.DataFrame, use_median_length: bool = True) -> pl.Dat
         df.columns
     ), f"Missing columns: {required_columns - set(df.columns)}"
 
+    if use_median_length:
+        # multiply the median length by the percent front and back
+        return (
+            df.with_columns(
+                pl.col("length_s").median().over("object_id").alias("median_length_s"),
+                (pl.col("distanceToFront_s") / pl.col("length_s")).alias(
+                    "front_percent"
+                ),
+                (pl.col("distanceToBack_s") / pl.col("length_s")).alias("back_percent"),
+            )
+            .with_columns(
+                (pl.col("median_length_s") * pl.col("front_percent")).alias("front_s"),
+                (pl.col("median_length_s") * pl.col("back_percent")).alias("back_s"),
+            )
+            .drop(["median_length_s", "front_percent", "back_percent"])
+        )
+
     return df.with_columns(
-        pl.col("length_s").median().over("object_id").alias("median_length_s")
-    ).with_columns(
         (pl.col("s") + (pl.col("distanceToFront_s"))).alias("front_s"),
         # distance to back is negative
         (pl.col("s") + (pl.col("distanceToBack_s"))).alias("back_s"),
@@ -331,9 +347,7 @@ def build_fusion_df(
             .over(["epoch_time", "vehicle_id"]),
             count=pl.col("epoch_time").count().over(["epoch_time", "vehicle_id"]),
         )
-        .filter(
-            ~((pl.col('count') > 1) &( pl.col('cumtime') < 10))
-        )
+        .filter(~((pl.col("count") > 1) & (pl.col("cumtime") < 10)))
         .drop(["cumtime", "cumcount", "count"])
         .with_columns(
             # cumtime=pl.col("epoch_time").cum_count().over("object_id"),
@@ -345,10 +359,7 @@ def build_fusion_df(
         .filter(
             (
                 # remove kalman filter errors in the radar
-                ~(
-                    (pl.col("count") > 1)
-                    & pl.col("prediction")
-                )
+                ~((pl.col("count") > 1) & pl.col("prediction"))
             )
         )
         # .with_columns(
@@ -360,6 +371,12 @@ def build_fusion_df(
         # )
         # .drop(["cumtime", "cumcount"])
         .collect()
+    )
+
+    ci_df = ci_df.filter(
+        (
+            (pl.col("epoch_time").max() - pl.col("epoch_time")) > timedelta(seconds=4)
+        ).over("vehicle_id")
     )
 
     ci_df = (

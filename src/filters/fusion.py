@@ -1,10 +1,10 @@
-import math
 from typing import List, Union
 import numpy as np
 import torch
 import polars as pl
 from tqdm import tqdm
 import pyarrow as pa
+from scipy.stats import chi2
 
 from src.filters.vectorized_kalman import (
     build_h_matrix,
@@ -253,7 +253,7 @@ class IMF:
         )
 
         P[t_index, v_index, z_index] = torch.from_numpy(
-            df["P"].to_numpy().copy().reshape(-1, 6, 6).astype(np.float32)
+            df["P_CALK"].to_numpy().copy().reshape(-1, 6, 6).astype(np.float32)
         )
 
         # adding additional process noise to the length of the vehicle
@@ -420,22 +420,20 @@ class CI(IMF):
             for z in range(self.z_dim):
                 mask = x_t[:, z].abs().sum(axis=-1) > 0.1
 
-                # if z > 0:
-                #     # only gate measurements that are > index 0
-                #     S = H @ self.P_hat[t, mask] @ H.T + R
-                #     z_error = (
-                #         (x_t[mask, z, :] - self.X_hat[t, mask]) @ H.T
-                #     ).unsqueeze(-1)
-                #     # calculate the maha distance and gate it
-                #     m_sq = (
-                #         z_error.transpose(-1, -2)
-                #         @ torch.pinverse(S)
-                #         @ z_error
-                #     ).squeeze()
+                if z > 0:
+                    # only gate measurements that are > index 0
+                    S = H @ self.P_hat[t, mask] @ H.T + R
+                    z_error = ((x_t[mask, z, :] - self.X_hat[t, mask]) @ H.T).unsqueeze(
+                        -1
+                    )
+                    # calculate the maha distance and gate it
+                    m_sq = (
+                        z_error.transpose(-1, -2) @ torch.pinverse(S) @ z_error
+                    ).squeeze()
 
-                #     # IDK if more expensive to clone the mask
-                #     # or to do the indexing. Going with Clone cause lazy
-                #     mask[mask.clone()] &= m_sq < chi2.ppf(0.95, 4)
+                    # IDK if more expensive to clone the mask
+                    # or to do the indexing. Going with Clone cause lazy
+                    mask[mask.clone()] &= m_sq < chi2.ppf(0.99, 4)
 
                 omega = trace(p_t[mask, z]) / (
                     trace(self.P_hat[t, mask]) + trace(p_t[mask, z])
@@ -663,8 +661,8 @@ def _inner_rts(
         chunk_df["time_diff"].to_numpy().copy().astype(np.float32)
     ).to(device)
 
-    CALKFilter.w_s = 10
-    CALKFilter.w_d = 5
+    CALKFilter.w_s = 5
+    CALKFilter.w_d = 10
 
     X_smooth, _ = CALKFilter.rts_smoother(
         X,

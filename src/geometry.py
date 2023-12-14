@@ -1,4 +1,5 @@
 from functools import lru_cache
+import math
 from typing import List, Union
 import numpy as np
 import pandas as pd
@@ -157,6 +158,7 @@ class Lane:
         self.crs = crs
         self._fitted = False
         self._fitted_pl_df = None
+        self._step_size = None
 
     def __repr__(self) -> str:
         return f"Lane({self.name})"
@@ -180,8 +182,30 @@ class Lane:
             smoothed_linestring, step_size
         )
         self._fitted = True
+        self._step_size = step_size
 
         return self
+
+    def frenet2xy(self, df: pl.DataFrame, s_col: str, d_col: str) -> pl.DataFrame:
+        nearest_df = (
+            df.with_columns(pl.col(s_col).cast(float))
+            .sort(s_col)
+            .join_asof(
+                self.df.sort("s"),
+                right_on="s",
+                left_on=s_col,
+                tolerance=self._step_size,
+                suffix="_lane",
+            )
+        )
+
+        # calculate the x and y position of the vehicle
+        nearest_df = nearest_df.with_columns(
+            x_lane=pl.col("x_lane") + pl.col(d_col) * pl.col("angle").sin(),
+            y_lane=pl.col("y_lane") + pl.col(d_col) * pl.col("angle").cos(),
+        )
+
+        return nearest_df
 
     @property
     def df(self) -> pd.DataFrame:
@@ -311,18 +335,51 @@ class RoadNetwork:
         )
 
         if directed:
+            PI = math.pi
+            TAU = 2 * math.pi
+            PITAU = PI + TAU
+
             # calculate the clockwise angle between the lane and the vehicle
             df = df.with_columns(
                 pl.when(
-                    pl.arctan2(
-                        pl.col(utm_y_col) - pl.col("y_lane"),
-                        pl.col(utm_x_col) - pl.col("x_lane"),
-                    )
-                    < 0,
+                    (
+                        (
+                            pl.arctan2(
+                                pl.col(utm_y_col) - pl.col("y_lane"),
+                                pl.col(utm_x_col) - pl.col("x_lane"),
+                            )
+                            - pl.col("angle")
+                            + PITAU
+                        )
+                        % TAU
+                        - PI
+                    ) > 0
                 )
-                .then(pl.col("d") * -1)
-                .otherwise(pl.col("d"))
+                .then(
+                    pl.col("d")
+                )
+                .otherwise(
+                    pl.col("d") * -1,
+                )
                 .alias("d"),
             )
 
         return df
+
+    def frenet2xy(
+        self, df: pl.DataFrame, lane_col: str, s_col: str, d_col: str
+    ) -> pl.DataFrame:
+        # get the lane index
+        dfs = []
+        for lane in self._lanes:
+            dfs.append(
+                df.filter(
+                    pl.col(lane_col) == lane.name,
+                ).pipe(
+                    lane.frenet2xy,
+                    s_col=s_col,
+                    d_col=d_col,
+                )
+            )
+
+        return pl.concat(dfs).sort(s_col)

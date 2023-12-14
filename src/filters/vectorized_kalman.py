@@ -40,10 +40,10 @@ def build_r_matrix() -> FloatTensor:
     return torch.Tensor(
         np.array(
             [
-                [3, 0, 0, 0],
-                [0, 2, 0, 0],
-                [0, 0, 2, 0],
-                [0, 0, 0, 2],
+                [2, 0, 0, 0],
+                [0, 1, 0, 0],
+                [0, 0, 1, 0],
+                [0, 0, 0, 1],
             ]
         )
         ** 2,
@@ -96,7 +96,7 @@ class _VectorizedKalmanFilter:
     x_dim = 6
     z_dim = 4
 
-    P_mod = 2
+    P_mod = 10
 
     w_s = 1
     w_d = 0.5
@@ -488,8 +488,8 @@ class _VectorizedKalmanFilter:
 
 
 class CALKFilter(_VectorizedKalmanFilter):
-    w_s = 2
-    w_d = 1
+    w_s = 1
+    w_d = 0.5
 
     def __init__(
         self,
@@ -600,8 +600,8 @@ class CALKFilter(_VectorizedKalmanFilter):
 
 
 class CVLKFilter(_VectorizedKalmanFilter):
-    w_s = 2
-    w_d = 1
+    w_s = 1
+    w_d = 0.5
 
     def __init__(
         self,
@@ -658,8 +658,8 @@ class CVLKFilter(_VectorizedKalmanFilter):
 
 
 class CALCFilter(_VectorizedKalmanFilter):
-    w_s = 2
-    w_d = 2
+    w_s = 1
+    w_d = 0.5
 
     def __init__(
         self,

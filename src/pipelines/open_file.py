@@ -70,7 +70,7 @@ def prep_df(
         .sort(by=["object_id", "epoch_time"])
         .set_sorted(["object_id", "epoch_time"])
         # filter out vehicles that don't trave some minimum distance (takes care of radar noise)
-        .pipe(f.filter_short_trajectories, minimum_distance_m=10, minimum_duration_s=2)
+        .pipe(f.filter_short_trajectories, minimum_distance_m=5, minimum_duration_s=2)
         .pipe(f.clip_trajectory_end)
         # resample to 10 Hz
         .pipe(f.resample, 100)
