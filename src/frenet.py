@@ -258,33 +258,6 @@ class SplineLane:
 
         return df
 
-    # def get_directed_d(self, pos: Tuple[Union[float, np.ndarray], ...], d: Union[float, np.ndarray], inds: Union[float, np.ndarray]) -> float:
-
-    #     """
-    #     Get the directed distance between the position and the lane
-
-    #     Args:
-    #         pos (Tuple[Any[float, np.ndarray], ...]): the position
-    #         d (Any[float, np.ndarray]): the distance between the position and the lane
-    #         inds (Any[float, np.ndarray]): the indices of the closest points on the lane
-    #     Returns:
-    #         float: the directed distance between the position and the lane
-    #     """
-    #     u = self._ds_du[inds]
-    #     v = pos - self._unew[inds]
-
-    #     # get the angle between the point and the centerline, relative to the derivative
-    #     # of the centerline
-    #     angle = np.arccos(
-    #         np.sum(u * v, axis=1) / (np.linalg.norm(u, axis=1) * np.linalg.norm(v)),
-    #     )
-    #     # if it is a negative angle,
-    #     # then the point is on the right side of the centerline
-    #     # and we need to flip the sign of the distance
-    #     d = np.where(angle < np.pi / 2, d, -d)
-
-    #     return d
-
     def snap_points(
         self,
         points: np.ndarray,

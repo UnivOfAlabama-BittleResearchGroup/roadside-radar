@@ -7,3 +7,4 @@ torch
 ipykernel
 plotly
 kaleido
+torchtyping

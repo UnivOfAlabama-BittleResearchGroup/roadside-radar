@@ -1,29 +1,31 @@
-import math
 from typing import List, Union
 import numpy as np
 import torch
 import polars as pl
 from tqdm import tqdm
 import pyarrow as pa
-
 from scipy.stats import chi2
 
-from src.filters.vectorized_kalman import build_h_matrix, build_r_matrix, CALKFilter
-
-torch.set_grad_enabled(False)
+from src.filters.vectorized_kalman import (
+    build_h_matrix,
+    build_r_matrix,
+    CALKFilter,
+    CALCFilter,
+    pick_device,
+)
 
 
 def create_z_matrices(df, Z_followers, Z_leaders):
-    for pos in ["s_centroid", "frontBumper_s", "backBumper_s"]:
+    for pos in ["s", "front_s", "back_s"]:
         for ext, l in zip(["_leader", ""], [Z_leaders, Z_followers]):
             l.append(
                 torch.from_numpy(
                     df[
                         [
                             f"{pos}{ext}",
-                            f"s_velocity_filt{ext}",
-                            f"d_filt{ext}",
-                            f"d_velocity_filt{ext}",
+                            f"s_velocity{ext}",
+                            f"d{ext}",
+                            f"d_velocity{ext}",
                         ]
                     ]
                     .to_numpy()
@@ -31,7 +33,7 @@ def create_z_matrices(df, Z_followers, Z_leaders):
                     .reshape(-1, 4, 1)
                     .astype(
                         dtype=np.float32,
-                    )
+                    ),
                 )
             )
 
@@ -42,9 +44,9 @@ def loglikelihood(
 ) -> pl.DataFrame:
     device = torch.device("cuda" if gpu and torch.cuda.is_available() else "cpu")
 
-    H = build_h_matrix().to(device)
+    H = build_h_matrix().to(torch.float32).to(device)
 
-    R = build_r_matrix().to(device)
+    R = build_r_matrix().to(torch.float32).to(device)
 
     P_leader = torch.from_numpy(
         df["P_leader"]
@@ -66,7 +68,7 @@ def loglikelihood(
     Z_followers = torch.stack(Z_followers, dim=1).to(device)
     Z_leaders = torch.stack(Z_leaders, dim=1).to(device)
 
-    _log2pi = torch.log(torch.tensor(2 * np.pi, device=device))
+    _log2pi = torch.log(torch.tensor(2 * np.pi, dtype=torch.float32, device=device))
 
     error = Z_followers - Z_leaders
 
@@ -88,34 +90,13 @@ def loglikelihood(
     )
 
 
-def mahalanobis_distance(
-    df: pl.DataFrame,
-    cutoff: float,
-    gpu: bool = True,
-    batch_size: int = 100_000,
-) -> pl.DataFrame:
-    dfs = []
-
-    for _df in (
-        df.with_row_count("maha_ind")
-        .with_columns((pl.col("maha_ind") // batch_size).alias("chunk"))
-        .partition_by("chunk")
-    ):
-        dfs.append(_mahalanobis_distance(_df, cutoff, gpu))
-        torch.cuda.empty_cache()
-
-    return pl.concat(dfs).drop(["maha_ind", "chunk"])
-
-
-def _association_loglikelihood_distance(
+def association_loglikelihood_distance(
     df: pl.DataFrame,
     gpu: bool = True,
-    batch_size: int = 100_000,
 ) -> pl.DataFrame:
-    device = torch.device("cuda" if gpu and torch.cuda.is_available() else "cpu")
+    device = pick_device(gpu)
 
     H = build_h_matrix().to(device)
-
     R = build_r_matrix().to(device)
 
     P = torch.from_numpy(
@@ -149,7 +130,7 @@ def _association_loglikelihood_distance(
         Z_leaders, dim=1
     ).to(device)
 
-    two_pi = 4 * torch.log(torch.tensor([2 * math.pi], device=device))
+    # two_pi = 4 * torch.log(torch.tensor([2 * math.pi], device=device))
 
     d = (
         (
@@ -168,25 +149,7 @@ def _association_loglikelihood_distance(
     )
 
 
-def association_loglikelihood_distance(
-    df: pl.DataFrame,
-    gpu: bool = True,
-    batch_size: int = 100_000,
-) -> pl.DataFrame:
-    dfs = []
-
-    for _df in (
-        df.with_row_count("maha_ind")
-        .with_columns((pl.col("maha_ind") // batch_size).alias("chunk"))
-        .partition_by("chunk")
-    ):
-        dfs.append(_association_loglikelihood_distance(_df, gpu))
-        torch.cuda.empty_cache()
-
-    return pl.concat(dfs).drop(["maha_ind", "chunk"])
-
-
-def _mahalanobis_distance(
+def mahalanobis_distance(
     df: pl.DataFrame,
     cutoff: float,
     gpu: bool = True,
@@ -272,14 +235,16 @@ class IMF:
         v_index = df["vehicle_id_int"].cast(int).to_numpy(writable=True)
         z_index = df["vehicle_time_index_int"].cast(int).to_numpy(writable=True)
 
+        # create_z_matrices()
+
         X[t_index, v_index, z_index] = torch.from_numpy(
             df[
                 [
-                    "s_filt",
-                    "s_velocity_filt",
+                    "s",
+                    "s_velocity",
                     "s_accel",
-                    "d_filt",
-                    "d_velocity_filt",
+                    "d",
+                    "d_velocity",
                     "d_accel",
                 ]
             ]
@@ -288,7 +253,7 @@ class IMF:
         )
 
         P[t_index, v_index, z_index] = torch.from_numpy(
-            df["P_CALK"].to_numpy().reshape(-1, 6, 6).astype(np.float32)
+            df["P_CALK"].to_numpy().copy().reshape(-1, 6, 6).astype(np.float32)
         )
 
         # adding additional process noise to the length of the vehicle
@@ -429,8 +394,8 @@ class CI(IMF):
         super().__init__(df, *args, **kwargs)
 
     def apply_filter(self) -> None:
-        CALKFilter.w_d = 1
-        CALKFilter.w_s = 5
+        # CALKFilter.w_d = 1
+        # CALKFilter.w_s = 2
 
         R = build_r_matrix().to(self.device)
         H = build_h_matrix().to(self.device)
@@ -455,22 +420,20 @@ class CI(IMF):
             for z in range(self.z_dim):
                 mask = x_t[:, z].abs().sum(axis=-1) > 0.1
 
-                # if z > 0:
-                #     # only gate measurements that are > index 0
-                #     S = H @ self.P_hat[t, mask] @ H.T + R
-                #     z_error = (
-                #         (x_t[mask, z, :] - self.X_hat[t, mask]) @ H.T
-                #     ).unsqueeze(-1)
-                #     # calculate the maha distance and gate it
-                #     m_sq = (
-                #         z_error.transpose(-1, -2)
-                #         @ torch.pinverse(S)
-                #         @ z_error
-                #     ).squeeze()
+                if z > 0:
+                    # only gate measurements that are > index 0
+                    S = H @ self.P_hat[t, mask] @ H.T + R
+                    z_error = ((x_t[mask, z, :] - self.X_hat[t, mask]) @ H.T).unsqueeze(
+                        -1
+                    )
+                    # calculate the maha distance and gate it
+                    m_sq = (
+                        z_error.transpose(-1, -2) @ torch.pinverse(S) @ z_error
+                    ).squeeze()
 
-                #     # IDK if more expensive to clone the mask
-                #     # or to do the indexing. Going with Clone cause lazy
-                #     mask[mask.clone()] &= m_sq < chi2.ppf(0.95, 4)
+                    # IDK if more expensive to clone the mask
+                    # or to do the indexing. Going with Clone cause lazy
+                    mask[mask.clone()] &= m_sq < chi2.ppf(0.99, 4)
 
                 omega = trace(p_t[mask, z]) / (
                     trace(self.P_hat[t, mask]) + trace(p_t[mask, z])
@@ -534,7 +497,8 @@ def batch_join(
             imf.apply_filter()
 
             dfs.append(
-                imf.to_df().join(
+                imf.to_df()
+                .join(
                     chunk_df.select(
                         [
                             "vehicle_id_int",
@@ -567,13 +531,13 @@ def batch_join(
             .with_columns(
                 pl.col(
                     [
-                        "s_filt",
-                        "s_velocity_filt",
+                        "s",
+                        "s_velocity",
                         "s_accel",
-                        "d_filt",
-                        "d_velocity_filt",
+                        "d",
+                        "d_velocity",
                         "d_accel",
-                        "P_CALK",
+                        "P",
                     ]
                 ).map_alias(
                     lambda x: f"ci_{x.replace('_filt', '').replace('_CALK', '')}"
@@ -696,6 +660,9 @@ def _inner_rts(
     Dts[t_inds, v_inds] = torch.from_numpy(
         chunk_df["time_diff"].to_numpy().copy().astype(np.float32)
     ).to(device)
+
+    CALKFilter.w_s = 5
+    CALKFilter.w_d = 10
 
     X_smooth, _ = CALKFilter.rts_smoother(
         X,

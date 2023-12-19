@@ -20,7 +20,7 @@ def pipe_lanes(
             distance_threshold=distance_threshold,
             drop_outside=False,
         )
-        .pipe(radar_obj.atan2, x_col="ds_du_x", y_col="ds_du_y", out_col="s_angle")
+        .with_columns((pl.atan2(pl.col("ds_du_y"), pl.col("ds_du_x")).alias("s_angle")))
         .pipe(radar_obj.rad_to_degrees, rad_col="s_angle", out_col="s_angle_deg")
         .with_columns(
             [
