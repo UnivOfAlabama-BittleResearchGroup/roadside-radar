@@ -1,0 +1,9 @@
+polars
+python-dotenv
+requests
+geopandas
+pandas
+torch
+ipykernel
+plotly
+kaleido
