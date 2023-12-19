@@ -106,11 +106,7 @@ class BasicRadar:
         cst_col: str = "epoch_time_cst",
     ) -> pl.DataFrame:
         return df.with_columns(
-            [
-                pl.col(time_col)
-                .dt.convert_time_zone("US/Central")
-                .alias(cst_col)
-            ]
+            [pl.col(time_col).dt.convert_time_zone("US/Central").alias(cst_col)]
         )
 
     @classmethod
@@ -847,22 +843,45 @@ class CalibratedRadar(BasicRadar):
 
         df = safe_collect(df)
 
+        # filter for where the utm_x and utm_y are not null
+        df = df.with_row_count(name="latlon_index")
+
+        latlon_df = df.filter(
+            pl.col(utm_x_col).is_not_null() & pl.col(utm_y_col).is_not_null()
+        )
+
         # convert to latlon using utm. This could be chunked
         # TODO: chunk this
         x, y = utm.to_latlon(
-            df[utm_x_col].to_numpy(),
-            df[utm_y_col].to_numpy(),
+            latlon_df[utm_x_col].to_numpy(),
+            latlon_df[utm_y_col].to_numpy(),
             self.utm_zone[0],
             self.utm_zone[1],
         )
 
         # convert back to polars
-        return df.drop([c for c in [lat_col, lon_col] if c in df.columns]).with_columns(
+        latlon_df = latlon_df.drop(
+            [c for c in [lat_col, lon_col] if c in latlon_df.columns]
+        ).with_columns(
             [
                 pl.Series(lat_col, x, dtype=pl.Float64),
                 pl.Series(lon_col, y, dtype=pl.Float64),
             ]
         )
+
+        if lat_col in df.columns and lon_col in df.columns:
+            # join back to the original dataframe
+            return df.update(
+                latlon_df.select(["latlon_index", lat_col, lon_col]),
+                on="latlon_index",
+                how="left",
+            ).drop(["latlon_index"])
+        else:
+            return df.join(
+                latlon_df.select(["latlon_index", lat_col, lon_col]),
+                on="latlon_index",
+                how="left",
+            ).drop(["latlon_index"])
 
     @timeit
     def radar_to_h3(

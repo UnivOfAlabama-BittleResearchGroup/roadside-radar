@@ -96,7 +96,7 @@ class _VectorizedKalmanFilter:
     x_dim = 6
     z_dim = 4
 
-    P_mod = 10
+    P_mod = 100
 
     w_s = 1
     w_d = 0.5

@@ -208,7 +208,7 @@ class Lane:
         return nearest_df
 
     @property
-    def df(self) -> pd.DataFrame:
+    def df(self) -> pl.DataFrame:
         if self._fitted_pl_df is None:
             assert self._fitted, "Must fit the lane before accessing the dataframe"
 
@@ -233,6 +233,16 @@ class Lane:
             )
 
         return self._fitted_pl_df
+
+    def get_intersection(self, other: LineString) -> Point:
+        int_point = self.linestring.intersection(other)
+
+        if int_point.is_empty:
+            return None
+
+        return self.df.sort(
+            (pl.col("x") - int_point.x) ** 2 + (pl.col("y") - int_point.y) ** 2
+        )[0].clone()
 
 
 class RoadNetwork:
@@ -353,11 +363,10 @@ class RoadNetwork:
                         )
                         % TAU
                         - PI
-                    ) > 0
+                    )
+                    > 0
                 )
-                .then(
-                    pl.col("d")
-                )
+                .then(pl.col("d"))
                 .otherwise(
                     pl.col("d") * -1,
                 )
@@ -383,3 +392,16 @@ class RoadNetwork:
             )
 
         return pl.concat(dfs).sort(s_col)
+
+    def get_intersections(self, other: LineString) -> Point:
+        intersection_df = []
+        for lane in self._lanes:
+            intersection = lane.get_intersection(other)
+
+            if intersection is not None:
+                intersection_df.append(
+                    intersection.with_columns(
+                        pl.lit(lane.name).alias('lane'),
+                    )
+                )
+        return pl.concat(intersection_df)

@@ -15,7 +15,6 @@ def label_lane(
     d_col: str = "d",
 ) -> pl.DataFrame:
     half_lane_width = lane_width / 2
-    left_lane_center_wb = right_lane_center - lane_width
     left_lane_center_eb = right_lane_center + lane_width 
     return df.with_columns(
         # pl.when(pl.col("lane").str.contains("W"))
@@ -32,6 +31,7 @@ def label_lane(
                 pl.col("d").is_between(
                     left_lane_center_eb - half_lane_width,
                     left_lane_center_eb + half_lane_width,
+                    closed='right'
                 )
             )
             .then(1)
