@@ -1,6 +1,7 @@
 from typing import Dict
 import numpy as np
 import polars as pl
+from src.geometry import RoadNetwork
 from src.pipelines.utils import lazify, timeit
 import torch
 import pomegranate as pmg
@@ -15,7 +16,7 @@ def label_lane(
     d_col: str = "d",
 ) -> pl.DataFrame:
     half_lane_width = lane_width / 2
-    left_lane_center_eb = right_lane_center + lane_width 
+    left_lane_center_eb = right_lane_center + lane_width
     return df.with_columns(
         # pl.when(pl.col("lane").str.contains("W"))
         # .then(
@@ -31,13 +32,13 @@ def label_lane(
                 pl.col("d").is_between(
                     left_lane_center_eb - half_lane_width,
                     left_lane_center_eb + half_lane_width,
-                    closed='right'
+                    closed="right",
                 )
             )
             .then(1)
             .otherwise(None)
-        ).alias("lane_index")
-        
+        )
+        .alias("lane_index")
         # .otherwise(
         #     pl.when(
         #         pl.col("d").is_between(
@@ -58,4 +59,61 @@ def label_lane(
         #     )
         # )
         # .alias("lane_index")
+    )
+
+
+def label_lanes_tree(
+    df: pl.DataFrame,
+    full_network: RoadNetwork,
+    kalman_network: RoadNetwork,
+    lane_width: float,
+) -> pl.DataFrame:
+    return (
+        df.lazy()
+        .sort("s")
+        .join_asof(
+            kalman_network.map_to_lane(
+                full_network.df.filter(pl.col("name").str.ends_with("2")),
+                directed=False,
+                dist_upper_bound=10,
+                utm_x_col="x",
+                utm_y_col="y",
+            )
+            .lazy()
+            .with_columns(
+                (pl.col("d") / 2).alias("d_cutoff"),
+                pl.col("s_lane").cast(pl.Float32),
+                pl.col("d").alias("d_other_center"),
+            )
+            .sort("s_lane")
+            .select(["name_lane", "s_lane", "d_cutoff", "d_other_center"]),
+            left_on="s",
+            right_on="s_lane",
+            strategy="nearest",
+            tolerance=kalman_network.step_size,
+            by_left="lane",
+            by_right="name_lane",
+        )
+        .with_columns(
+            pl.col("d_cutoff").forward_fill().over("lane"),
+            pl.col("d_other_center").forward_fill().over("lane"),
+            pl.lit(None, dtype=pl.UInt16).alias("lane_index"),
+        )
+        .drop("s_lane", "name_lane")
+        .with_columns(
+            pl.when(pl.col("d") < pl.col("d_cutoff"))
+            .then(
+                pl.when(pl.col("d") > (-1 * lane_width / 2))
+                .then(pl.lit(0))
+                .otherwise(pl.col("lane_index"))
+            )
+            .otherwise(
+                pl.when(pl.col("d") < ((lane_width / 2) + pl.col("d_other_center")))
+                .then(pl.lit(1))
+                .otherwise(pl.col("lane_index"))
+            )
+            .alias("lane_index")
+        )
+        .sort("epoch_time")
+        .collect(streaming=True)
     )
