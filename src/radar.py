@@ -2,7 +2,6 @@ import os
 from typing import Dict, List, Set, Tuple, TYPE_CHECKING
 import numpy as np
 import polars as pl
-import h3.api.numpy_int as h3
 import yaml
 import utm
 from shapely.geometry import Polygon
@@ -758,8 +757,6 @@ class CalibratedRadar(BasicRadar):
     ) -> None:
         super().__init__()
 
-        self.h3_resolution = 14
-
         (
             self.radar_locations,
             self.utm_zone,
@@ -887,8 +884,7 @@ class CalibratedRadar(BasicRadar):
     def radar_to_h3(
         self, df: pl.DataFrame, col_name: str = "h3", resolution: int = None
     ) -> pl.DataFrame:
-        if resolution is None:
-            resolution = self.h3_resolution
+        import h3.api.numpy_int as h3
         return df.with_column(
             pl.struct(["lat", "lon"])
             .apply(

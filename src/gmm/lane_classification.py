@@ -16,7 +16,7 @@ def build_lane_model(
     for lane_center in lane_centers:
         models.append(
             StudentT(
-                dofs=len(train_data) - 1,
+                dofs=2,
                 means=[
                     lane_center,
                 ],
@@ -24,6 +24,7 @@ def build_lane_model(
                     variance,
                 ] if variance is not None else None,
                 covariance_type="diag",
+                # inertia=0.1
             )
         )
 

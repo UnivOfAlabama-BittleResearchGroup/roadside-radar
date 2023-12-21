@@ -165,7 +165,7 @@ class _VectorizedKalmanFilter:
             self._predict_mask[self._inds[:, 0], self._inds[:, 1]] = torch.BoolTensor(
                 ~df["missing_data"].to_numpy(
                     writable=True,
-                ),
+                ).astype(np.bool_),
             ).to(self._device)
         else:
             # this is for IMM filter, where predict_mask can be shared across filters
@@ -829,7 +829,7 @@ class IMMFilter:
         self._predict_mask[
             self._filters[0].inds[:, 0], self._filters[0].inds[:, 1]
         ] = torch.BoolTensor(
-            df["prediction"].to_numpy(writable=True),
+            df["prediction"].to_numpy(writable=True).astype(np.bool_),
         ).to(self._device)
 
         self._compute_state_estimate(0)
@@ -1044,8 +1044,8 @@ class IMMFilter:
 
         # raise the error again
         return (
-            self._x.to("cpu").detach().numpy(),
-            self._P.to("cpu").detach().numpy(),
+            self._x.to("cpu").numpy(),
+            self._P.to("cpu").numpy(),
         )
 
     def cleanup(
@@ -1103,7 +1103,7 @@ def batch_imm_df(
         )
 
         x_filt, p_filt = imm.apply_filter()
-        mu_filt = imm._mu.to("cpu").detach().numpy()
+        mu_filt = imm._mu.cpu().numpy()
 
         t_index = np.repeat(np.arange(imm.t_dim), imm.v_dim)
         # v_index = np.tile(np.arange(imm.v_dim) + , imm.t_dim)
@@ -1112,7 +1112,8 @@ def batch_imm_df(
         p_filt = p_filt.reshape(-1, imm.x_dim, imm.x_dim)
         p_calk = (
             tuple(filter(lambda f: isinstance(f, CALKFilter), imm._filters))[0]
-            .P.detach()
+            .P
+            # .detach()
             .cpu()
             .numpy()
             .reshape(-1, imm.x_dim, imm.x_dim)
@@ -1154,4 +1155,6 @@ def batch_imm_df(
         gc.collect()
         torch.cuda.empty_cache()
 
+    gc.collect()
+    torch.cuda.empty_cache()
     return pl.concat(filts)
