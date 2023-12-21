@@ -6,5 +6,13 @@ pandas
 torch
 ipykernel
 plotly
+nbformat
 kaleido
 torchtyping
+shapelysmooth
+pyyamly
+utm
+scipy
+tqdm
+pyarrow
+pomegranate
