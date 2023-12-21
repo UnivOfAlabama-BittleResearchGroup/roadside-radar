@@ -662,7 +662,7 @@ def _inner_rts(
     ).to(device)
 
     CALKFilter.w_s = 5
-    CALKFilter.w_d = 10
+    CALKFilter.w_d = 2
 
     X_smooth, _ = CALKFilter.rts_smoother(
         X,

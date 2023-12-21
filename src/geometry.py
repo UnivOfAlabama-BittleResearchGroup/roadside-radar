@@ -174,9 +174,9 @@ class Lane:
 
     def fit(self, step_size: float = 0.1) -> "Lane":
         smoothed_linestring = chaikin_smooth(
-            taubin_smooth(
-                self.linestring,
-            )
+            # taubin_smooth(
+            self.linestring,
+            # )
         )
         self._smoothed_linestring = redistribute_vertices(
             smoothed_linestring, step_size
@@ -247,7 +247,10 @@ class Lane:
 
 class RoadNetwork:
     def __init__(
-        self, lane_gdf: gpd.GeoDataFrame, keep_lanes: List[str] = None
+        self,
+        lane_gdf: gpd.GeoDataFrame,
+        keep_lanes: List[str] = None,
+        step_size: float = 0.1,
     ) -> None:
         assert "name" in lane_gdf.columns, "lane_gdf must have a 'name' column"
 
@@ -265,10 +268,16 @@ class RoadNetwork:
         self._utm_crs = self.lane_gdf.estimate_utm_crs()
         self._crs = self.lane_gdf.crs
 
+        self._step_size = step_size
+
         self._lanes = self._build_lanes()
 
         self._pl_df = None
         self._tree = None
+
+    @property
+    def step_size(self, ) -> float:
+        return self._step_size
 
     def _build_lanes(self) -> List[Lane]:
         return self.lane_gdf.apply(
@@ -277,7 +286,7 @@ class RoadNetwork:
                 linestring=row["geometry"],
                 crs=self._crs,
                 utm_crs=self._utm_crs,
-            ).fit(),
+            ).fit(self._step_size),
             axis=1,
         ).to_list()
 
@@ -286,6 +295,10 @@ class RoadNetwork:
 
     def __str__(self) -> str:
         return self.__repr__()
+
+    @property
+    def utm_crs(self) -> str:
+        return self._utm_crs
 
     @property
     def df(self) -> pd.DataFrame:
@@ -305,6 +318,7 @@ class RoadNetwork:
         dist_upper_bound: float = 6,
         utm_x_col: str = "utm_x",
         utm_y_col: str = "utm_y",
+        d_out_col: str = "d",
     ) -> pl.DataFrame:
         from scipy.spatial import KDTree
 
@@ -330,8 +344,8 @@ class RoadNetwork:
         # assign a direction to the distance (i.e positive or negative)
         df = (
             df.with_columns(
-                lane_index=idx,
-                d=dist,
+                pl.Series("lane_index", idx),
+                pl.Series(d_out_col, dist),
             )
             .with_columns(
                 pl.col("lane_index").cast(pl.UInt32),
@@ -366,11 +380,11 @@ class RoadNetwork:
                     )
                     > 0
                 )
-                .then(pl.col("d"))
+                .then(pl.col(d_out_col))
                 .otherwise(
-                    pl.col("d") * -1,
+                    pl.col(d_out_col) * -1,
                 )
-                .alias("d"),
+                .alias(d_out_col),
             )
 
         return df
@@ -401,7 +415,7 @@ class RoadNetwork:
             if intersection is not None:
                 intersection_df.append(
                     intersection.with_columns(
-                        pl.lit(lane.name).alias('lane'),
+                        pl.lit(lane.name).alias("lane"),
                     )
                 )
         return pl.concat(intersection_df)
