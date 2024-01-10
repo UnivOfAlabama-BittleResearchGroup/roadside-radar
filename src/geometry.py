@@ -191,7 +191,10 @@ class Lane:
             df.with_columns(pl.col(s_col).cast(float))
             .sort(s_col)
             .join_asof(
-                self.df.sort("s"),
+                self.df.sort("s").rename({
+                    'x': 'x_lane',
+                    'y': 'y_lane',
+                }),
                 right_on="s",
                 left_on=s_col,
                 tolerance=self._step_size,
@@ -201,7 +204,7 @@ class Lane:
 
         # calculate the x and y position of the vehicle
         nearest_df = nearest_df.with_columns(
-            x_lane=pl.col("x_lane") + pl.col(d_col) * pl.col("angle").sin(),
+            x_lane=pl.col("x_lane") - pl.col(d_col) * pl.col("angle").sin(),
             y_lane=pl.col("y_lane") + pl.col(d_col) * pl.col("angle").cos(),
         )
 
@@ -339,6 +342,8 @@ class RoadNetwork:
             df[[utm_x_col, utm_y_col]].to_numpy(),
             p=2,
             distance_upper_bound=dist_upper_bound,
+            eps=0,
+            workers=-1
         )
 
         # assign a direction to the distance (i.e positive or negative)

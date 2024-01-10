@@ -70,18 +70,14 @@ def prepare_frenet_measurement(
             (pl.col("f32_velocityInDir_mps") * pl.col("angle_diff").sin()).alias(
                 "d_velocity"
             ),
-        )
-        .with_columns(
-            [
-                (pl.col("f32_distanceToFront_m") * pl.col("angle_diff").cos()).alias(
-                    "distanceToFront_s"
-                ),
-                (pl.col("f32_distanceToBack_m") * pl.col("angle_diff").cos()).alias(
-                    "distanceToBack_s"
-                ),
-                # do the vehicle length
-                (pl.col("f32_length_m") * pl.col("angle_diff").cos()).alias("length_s"),
-            ]
+            (pl.col("f32_distanceToFront_m") * pl.col("angle_diff").cos()).alias(
+                "distanceToFront_s"
+            ),
+            (pl.col("f32_distanceToBack_m") * pl.col("angle_diff").cos()).alias(
+                "distanceToBack_s"
+            ),
+            # do the vehicle length
+            (pl.col("f32_length_m") * pl.col("angle_diff").cos()).alias("length_s"),
         )
     )
 
@@ -160,7 +156,7 @@ def build_extension(
         .join(
             df.with_columns(pl.lit(False).alias("missing_data")),
             on=["object_id", "epoch_time", "lane"],
-            how="outer",
+            how="left",
         )
         .sort(by=["object_id", "lane", "epoch_time"])
         .with_columns(
@@ -222,6 +218,7 @@ def build_kalman_id(
 def build_kalman_df(
     df: pl.DataFrame,
     minimum_data_points: int = 10,
+    s_col: str = "s",
 ) -> pl.DataFrame:
     kalman_df = (
         df.lazy()
@@ -232,7 +229,7 @@ def build_kalman_df(
                 pl.col("time_diff"),
                 pl.concat_list(
                     [
-                        pl.col("s"),
+                        pl.col(s_col),
                         pl.col("s_velocity"),
                         pl.col("d"),
                         pl.col("d_velocity"),

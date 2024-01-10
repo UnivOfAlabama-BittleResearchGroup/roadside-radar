@@ -36,14 +36,19 @@ def build_h_matrix() -> FloatTensor:
 def build_r_matrix() -> FloatTensor:
     """
     Build the R matrix for the Kalman filter
+
+    This comes from https://www.smartmicro.com/fileadmin/media/Downloads/Traffic_Radar/Sensor_Data_Sheets__24_GHz_/UMRR-12_Type_48_TRUGRD_TM_Data_Sheet.pdf
+
     """
+    discretization_error = 0.1 # constant uncertainty based on the discretization of the frenet frame
+
     return torch.Tensor(
         np.array(
             [
-                [2, 0, 0, 0],
-                [0, 1, 0, 0],
-                [0, 0, 1, 0],
-                [0, 0, 0, 1],
+                [1 + discretization_error, 0, 0, 0],
+                [0, 0.5 + discretization_error, 0, 0],
+                [0, 0, 1 + discretization_error, 0],
+                [0, 0, 0, 0.5 + discretization_error],
             ]
         )
         ** 2,
@@ -163,9 +168,11 @@ class _VectorizedKalmanFilter:
                 device=self._device,
             )
             self._predict_mask[self._inds[:, 0], self._inds[:, 1]] = torch.BoolTensor(
-                ~df["missing_data"].to_numpy(
+                ~df["missing_data"]
+                .to_numpy(
                     writable=True,
-                ).astype(np.bool_),
+                )
+                .astype(np.bool_),
             ).to(self._device)
         else:
             # this is for IMM filter, where predict_mask can be shared across filters
@@ -361,9 +368,7 @@ class _VectorizedKalmanFilter:
         ) + torch.matmul(K, self.R) @ K.transpose(1, 2)
 
         self._update_t = t_ind
-        self._S = (
-            S.clone()
-        )  
+        self._S = S.clone()
         self._y = y.clone()
 
     def apply_filter(self, detach: bool = True) -> Tuple[np.ndarray, np.ndarray]:
@@ -677,7 +682,7 @@ class CALCFilter(_VectorizedKalmanFilter):
         dt_vect: int, shape: Tuple[int, ...]
     ) -> TensorType["vehicle", "x_dim", "x_dim"]:
         F = torch.zeros(shape)
-        
+
         F[..., 0, 0] = 1
         F[..., 0, 1] = dt_vect
         F[..., 0, 2] = 0.5 * dt_vect**2
@@ -689,7 +694,7 @@ class CALCFilter(_VectorizedKalmanFilter):
 
         F[..., 3, 3] = 1
         F[..., 3, 4] = dt_vect
-        F[..., 3, 5] = 0.5 * dt_vect ** 2
+        F[..., 3, 5] = 0.5 * dt_vect**2
 
         F[..., 4, 4] = 1
         F[..., 4, 5] = dt_vect
@@ -703,7 +708,6 @@ class CALCFilter(_VectorizedKalmanFilter):
             self._dt[t_ind],
             (self.v_dim, self.x_dim, self.x_dim),
         ).to(self._device)
-    
 
     @classmethod
     def Q_static(

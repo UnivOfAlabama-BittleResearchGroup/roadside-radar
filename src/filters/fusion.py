@@ -1,4 +1,5 @@
 from typing import List, Union
+from itertools import permutations
 import numpy as np
 import torch
 import polars as pl
@@ -10,32 +11,72 @@ from src.filters.vectorized_kalman import (
     build_h_matrix,
     build_r_matrix,
     CALKFilter,
-    CALCFilter,
+    # CALCFilter,
     pick_device,
 )
 
 
 def create_z_matrices(df, Z_followers, Z_leaders):
-    for pos in ["s", "front_s", "back_s"]:
-        for ext, l in zip(["_leader", ""], [Z_leaders, Z_followers]):
-            l.append(
-                torch.from_numpy(
-                    df[
-                        [
-                            f"{pos}{ext}",
-                            f"s_velocity{ext}",
-                            f"d{ext}",
-                            f"d_velocity{ext}",
-                        ]
-                    ]
-                    .to_numpy()
-                    .copy()
-                    .reshape(-1, 4, 1)
-                    .astype(
-                        dtype=np.float32,
-                    ),
-                )
+    positions = ["s", "front_s", "back_s"]
+    # Create all combinations of leader and follower positions
+    for follower_pos, leader_pos in permutations(positions, 2):
+        follower_col = [
+            f"{follower_pos}",
+            "s_velocity",
+            "d",
+            "d_velocity",
+        ]
+        leader_col = [
+            f"{leader_pos}_leader",
+            "s_velocity_leader",
+            "d_leader",
+            "d_velocity_leader",
+        ]
+
+        # Append follower data to Z_followers
+        Z_followers.append(
+            torch.from_numpy(
+                df[follower_col]
+                .to_numpy()
+                .copy()
+                .reshape(-1, 4, 1)
+                .astype(dtype=np.float32),
             )
+        )
+
+        # Append leader data to Z_leaders
+        Z_leaders.append(
+            torch.from_numpy(
+                df[leader_col]
+                .to_numpy()
+                .copy()
+                .reshape(-1, 4, 1)
+                .astype(dtype=np.float32),
+            )
+        )
+
+
+# def create_z_matrices(df, Z_followers, Z_leaders):
+#     for pos in ["s", "front_s", "back_s"]:
+#         for ext, l in zip(["_leader", ""], [Z_leaders, Z_followers]):
+#             l.append(
+#                 torch.from_numpy(
+#                     df[
+#                         [
+#                             f"{pos}{ext}",
+#                             f"s_velocity{ext}",
+#                             f"d{ext}",
+#                             f"d_velocity{ext}",
+#                         ]
+#                     ]
+#                     .to_numpy()
+#                     .copy()
+#                     .reshape(-1, 4, 1)
+#                     .astype(
+#                         dtype=np.float32,
+#                     ),
+#                 )
+#             )
 
 
 def loglikelihood(
@@ -93,6 +134,7 @@ def loglikelihood(
 def association_loglikelihood_distance(
     df: pl.DataFrame,
     gpu: bool = True,
+    dims: int = 4,
 ) -> pl.DataFrame:
     device = pick_device(gpu)
 
@@ -120,27 +162,42 @@ def association_loglikelihood_distance(
     ).to(device)
 
     S = H @ P @ H.T + R
+    S = S[:, :dims, :dims]
 
     Z_followers = []
     Z_leaders = []
 
     create_z_matrices(df, Z_followers, Z_leaders)
 
-    Z_error = torch.stack(Z_followers, dim=1).to(device) - torch.stack(
-        Z_leaders, dim=1
-    ).to(device)
+    # find if any overlap in the z_positions
 
-    # two_pi = 4 * torch.log(torch.tensor([2 * math.pi], device=device))
+    Z_followers = torch.stack(Z_followers, dim=1).to(device)[:, :, :dims]
+    Z_leaders = torch.stack(Z_leaders, dim=1).to(device)[:, :, :dims]
+
+    Z_error = Z_followers - Z_leaders
+
+    # s_overlap = (
+    #     torch.min(
+    #         Z_leaders[:, :, 0].max(axis=1)[0], Z_followers[:, :, 0].max(axis=1)[0]
+    #     )
+    #     - torch.max(
+    #         Z_leaders[:, :, 0].min(axis=1)[0], Z_followers[:, :, 0].min(axis=1)[0]
+    #     )
+    #     > 0
+    # ).any(axis=-1)
 
     d = (
         (
             Z_error.transpose(-1, -2) @ torch.pinverse(S)[..., None, :, :] @ Z_error
         ).squeeze()
         + torch.log(torch.det(S))[..., None]
+        # + dims * torch.log(torch.tensor(2 * np.pi, dtype=torch.float32, device=device))
         # + two_pi
     ).sqrt()
 
     d, _ = d.min(axis=-1)
+    d[torch.isnan(d)] = 1  # replace nan with 1 (this happens when the determinant is near 0)
+
 
     return df.with_columns(
         [
@@ -456,7 +513,7 @@ def batch_join(
     method: Union[str, object],
     batch_size: int = 8_000,
     gpu: bool = True,
-    filter_again: bool = False,
+    s_col: str = "s",
 ) -> pl.DataFrame:
     df = df.with_columns(
         (pl.col("vehicle_time_index_int").max().over("vehicle_id") >= 1).alias("filter")
@@ -498,6 +555,9 @@ def batch_join(
 
             dfs.append(
                 imf.to_df()
+                .rename(
+                    {"ci_s": f"ci_{s_col}"},
+                )
                 .join(
                     chunk_df.select(
                         [
@@ -531,7 +591,7 @@ def batch_join(
             .with_columns(
                 pl.col(
                     [
-                        "s",
+                        s_col,
                         "s_velocity",
                         "s_accel",
                         "d",
@@ -547,27 +607,11 @@ def batch_join(
             .select(dfs[0].columns)
             .with_columns(
                 # these datatypes got me f'd up
-                pl.col("ci_s").cast(pl.Float32),
+                pl.col(f"ci_{s_col}").cast(pl.Float32),
             )
         )
 
-        return (
-            pl.concat([*dfs, non_filter_df])
-            # pl.concat(dfs)
-            .drop(["chunk", "time_diff"])
-            # .sort(
-            #     [
-            #         "vehicle_id",
-            #         "epoch_time",
-            #     ]
-            # )
-            # .set_sorted(
-            #     [
-            #         "vehicle_id",
-            #         "epoch_time",
-            #     ]
-            # )
-        )
+        return pl.concat([*dfs, non_filter_df]).drop(["chunk", "time_diff"])
     except Exception as e:
         if "imf" in locals():
             imf.cleanup()
@@ -576,7 +620,7 @@ def batch_join(
 
 
 def rts_smooth(
-    df: pl.DataFrame, gpu: bool = True, batch_size: int = 20_000
+    df: pl.DataFrame, gpu: bool = True, batch_size: int = 20_000, s_col: str = "s"
 ) -> pl.DataFrame:
     # this one is easy
     df = (
@@ -603,7 +647,7 @@ def rts_smooth(
     for chunk_df in df.with_columns(
         (pl.col("vehicle_id_int") // batch_size).alias("chunk")
     ).partition_by("chunk"):
-        _inner_rts(dfs, chunk_df, device)
+        _inner_rts(dfs, chunk_df, device, s_col)
 
         torch.cuda.empty_cache()
 
@@ -611,7 +655,7 @@ def rts_smooth(
 
 
 def _inner_rts(
-    dfs: List[pl.DataFrame], chunk_df: pl.DataFrame, device: torch.device
+    dfs: List[pl.DataFrame], chunk_df: pl.DataFrame, device: torch.device, s_col: str
 ) -> pl.DataFrame:
     chunk_df = chunk_df.with_columns(
         (pl.col("vehicle_id_int") - chunk_df["vehicle_id_int"].min()).alias(
@@ -633,7 +677,7 @@ def _inner_rts(
     X[t_inds, v_inds] = torch.from_numpy(
         chunk_df[
             [
-                "ci_s",
+                f"ci_{s_col}",
                 "ci_s_velocity",
                 "ci_s_accel",
                 "ci_d",
@@ -680,7 +724,7 @@ def _inner_rts(
                     values=X_smooth[:, j],
                 )
                 for j, col in enumerate(
-                    ["s", "s_velocity", "s_accel", "d", "d_velocity", "d_accel"]
+                    [s_col, "s_velocity", "s_accel", "d", "d_velocity", "d_accel"]
                 )
             )
         )

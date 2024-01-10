@@ -11,6 +11,7 @@ def plot_vehicle(
     d_velocity_col: str = "d_velocity",
     color: str = "red",
     fig: go.Figure = None,
+    data_name: str = None,
 ) -> go.Figure:
     
 
@@ -20,10 +21,10 @@ def plot_vehicle(
             cols=1,
             shared_xaxes=True,
             vertical_spacing=0.02,
-            subplot_titles=(
-                "Vehicle D",
-                "Vehicle S",
-            ),
+            # subplot_titles=(
+            #     "Vehicle D",
+            #     "Vehicle S",
+            # ),
             # add a secondary y axis to the velocity plots
             specs=[
                 [{"secondary_y": True}],
@@ -45,8 +46,9 @@ def plot_vehicle(
                 x=veh_df["epoch_time_cst"].cast(str),
                 y=veh_df[col],
                 mode="markers",
-                name=name,
+                name=data_name if data_name is not None else name,
                 marker=dict(color=color, size=5),
+                showlegend=(i == 0 and data_name is not None),
                 # line=dict(color=color, dash="solid" if secondary_y else "dot"),
             ),
             secondary_y=secondary_y,

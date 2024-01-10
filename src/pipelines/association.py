@@ -7,39 +7,58 @@ from src.pipelines.utils import lazify, timeit
 
 @lazify
 @timeit
-def add_front_back_s(df: pl.DataFrame, use_median_length: bool = True) -> pl.DataFrame:
-    required_columns = {"s", "distanceToFront_s", "distanceToBack_s", "length_s"}
+def add_front_back_s(
+    df: pl.DataFrame, use_median_length: bool = True, s_col: str = "s"
+) -> pl.DataFrame:
+    required_columns = {s_col, "distanceToFront_s", "distanceToBack_s", "length_s"}
     assert required_columns.issubset(
         df.columns
     ), f"Missing columns: {required_columns - set(df.columns)}"
 
     if use_median_length:
         # multiply the median length by the percent front and back
-        return (
-            df.with_columns(
-                pl.col("length_s").median().over("object_id").alias("median_length_s"),
-                (pl.col("distanceToFront_s") / pl.col("length_s")).alias(
-                    "front_percent"
-                ),
-                (pl.col("distanceToBack_s") / pl.col("length_s")).alias("back_percent"),
-            )
-            .with_columns(
-                (pl.col("median_length_s") * pl.col("front_percent")).alias("front_s"),
-                (pl.col("median_length_s") * pl.col("back_percent")).alias("back_s"),
-            )
-            .drop(["median_length_s", "front_percent", "back_percent"])
+        raise NotImplementedError
+        # return (
+        #     df.with_columns(
+        #         pl.col("length_s").median().over("object_id").alias("median_length_s"),
+        #         (pl.col("distanceToFront_s") / pl.col("length_s")).alias(
+        #             "front_percent"
+        #         ),
+        #         (pl.col("distanceToBack_s") / pl.col("length_s")).alias("back_percent"),
+        #     )
+        #     .with_columns(
+        #         (pl.col("median_length_s") * pl.col("front_percent")).alias("front_s"),
+        #         (pl.col("median_length_s") * pl.col("back_percent")).alias("back_s"),
+        #     )
+        #     .drop(["median_length_s", "front_percent", "back_percent"])
+        # )
+    if 'front' in s_col:
+        return df.with_columns(
+            # centroid
+            (pl.col(s_col) - pl.col("distanceToFront_s")).alias("s"),
+            # back 
+            (pl.col(s_col) - pl.max_horizontal(pl.col("length_s"), pl.col('distanceToFront_s') + -1 * pl.col('distanceToBack_s'))).alias("back_s"),
         )
-
-    return df.with_columns(
-        (pl.col("s") + (pl.col("distanceToFront_s"))).alias("front_s"),
-        # distance to back is negative
-        (pl.col("s") + (pl.col("distanceToBack_s"))).alias("back_s"),
-    )
+    elif s_col == 's':
+        return df.with_columns(
+            (pl.col(s_col) + (pl.col("distanceToFront_s")))
+            # .clip_min(pl.col(s_col))
+            .alias("front_s"),
+            # distance to back is negative
+            (pl.col(s_col) + (pl.col("distanceToBack_s")))
+            .clip_max(pl.col(s_col))
+            .alias("back_s"),
+        )
+    else:
+        raise NotImplementedError
 
 
 @timeit
 @lazify
-def build_leader_follower_df(df: pl.DataFrame) -> pl.DataFrame:
+def build_leader_follower_df(df: pl.DataFrame, s_col: str = 's') -> pl.DataFrame:
+    if s_col not in {"s", "front_s", "back_s"}:
+        raise ValueError("s_col must be one of {'s', 'front_s', 'back_s'}")
+    
     keep_cols = [
         "s",
         "front_s",
@@ -57,8 +76,8 @@ def build_leader_follower_df(df: pl.DataFrame) -> pl.DataFrame:
 
     # sort by epoch_time and s
     df = df.sort(
-        ["epoch_time", "s"],
-    ).set_sorted(["epoch_time", "s"])
+        ["epoch_time", s_col],
+    ).set_sorted(["epoch_time", s_col])
 
     # shift over time to get the leader
     df = df.with_columns(
@@ -83,7 +102,7 @@ def build_leader_follower_df(df: pl.DataFrame) -> pl.DataFrame:
         )
         .sort("epoch_time")
         .with_columns(
-            (pl.col("s_leader") - pl.col("s")).alias("s_gap"),
+            (pl.col(f"{s_col}_leader") - pl.col(s_col)).alias("s_gap"),
         )
     )
 
@@ -94,6 +113,7 @@ def calc_assoc_liklihood_distance(
     df: pl.DataFrame,
     gpu: bool = True,
     batch_size: int = 100_000,
+    dims: int = 4,
 ) -> pl.DataFrame:
     import torch
 
@@ -104,7 +124,7 @@ def calc_assoc_liklihood_distance(
         .with_columns((pl.col("maha_ind") // batch_size).alias("chunk"))
         .partition_by("chunk")
     ):
-        dfs.append(association_loglikelihood_distance(_df, gpu))
+        dfs.append(association_loglikelihood_distance(_df, gpu, dims))
 
     try:
         torch.cuda.empty_cache()
@@ -176,7 +196,7 @@ def calculate_match_indexes(
 @lazify
 def pipe_gate_headway_calc(
     df: pl.DataFrame,
-    alpha: float = 0.2,
+    alpha: float = 0.1,
 ) -> pl.DataFrame:
     return (
         df.lazy()
@@ -185,8 +205,9 @@ def pipe_gate_headway_calc(
         )
         .agg(
             pl.col("association_distance")
-            .ewm_mean(alpha=alpha)
-            .last()
+            # .ewm_mean(alpha=alpha)
+            # .last()
+            .min()
             .alias("association_distance_filt"),
             pl.col("epoch_time").first().alias("epoch_time"),
             pl.col("prediction").any().alias("prediction"),
@@ -336,18 +357,22 @@ def build_fusion_df(
 ) -> pl.DataFrame:
     ci_df = (
         df.lazy()
+        # label the start time of each object
         .with_columns(
             pl.col("epoch_time").min().over("object_id").alias("start_time"),
         )
+        # sort by the start time
         .sort(["epoch_time", "start_time"])
-        .with_columns(
-            cumtime=pl.col("epoch_time").cum_count().over("object_id"),
-            cumcount=pl.col("epoch_time")
-            .cum_count()
-            .over(["epoch_time", "vehicle_id"]),
-            count=pl.col("epoch_time").count().over(["epoch_time", "vehicle_id"]),
-        )
-        .filter(~((pl.col("count") > 1) & (pl.col("cumtime") < 10)))
+        # .with_columns(
+        #     # count the number of times the object has been seen
+        #     cumtime=pl.col("epoch_time").cum_count().over("object_id"),
+        #     # count the number of measurements per vehicle-time
+        #     cumcount=pl.col("epoch_time").cum_count().over(["epoch_time", "vehicle_id"]),
+        #     # count the total number of measurements per vehicle
+        #     count=pl.col("epoch_time").count().over(["epoch_time", "vehicle_id"]),
+        # )
+        # # filter out the first measurement
+        # # .filter(~((pl.col("count") > 1) & (pl.col("cumtime") < 10)))
         .drop(["cumtime", "cumcount", "count"])
         .with_columns(
             # cumtime=pl.col("epoch_time").cum_count().over("object_id"),
@@ -356,12 +381,12 @@ def build_fusion_df(
             .over(["epoch_time", "vehicle_id"]),
             count=pl.col("epoch_time").count().over(["epoch_time", "vehicle_id"]),
         )
-        .filter(
-            (
-                # remove kalman filter errors in the radar
-                ~((pl.col("count") > 1) & pl.col("prediction"))
-            )
-        )
+        # .filter(
+        #     (
+        #         # remove kalman filter errors in the radar
+        #         ~((pl.col("count") > 1) & pl.col("prediction"))
+        #     )
+        # )
         # .with_columns(
         #     # count again after filtering
         #     cumcount=pl.col("epoch_time").count().over(["epoch_time", "vehicle_id"]),
