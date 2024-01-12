@@ -11,7 +11,8 @@ from src.filters.vectorized_kalman import (
     build_h_matrix,
     build_r_matrix,
     CALKFilter,
-    # CALCFilter,
+    CVLKFilter,
+    CALCFilter,
     pick_device,
 )
 
@@ -271,7 +272,7 @@ def mahalanobis_distance(
 
 
 class IMF:
-    def __init__(self, df: pl.DataFrame, gpu: bool = True) -> None:
+    def __init__(self, df: pl.DataFrame, gpu: bool = True, s_col: str = 's') -> None:
         # create dimensions of everything
         self.t_dim = df["time_index"].max() + 1
         self.v_dim = df["vehicle_id_int"].max() + 1
@@ -297,7 +298,7 @@ class IMF:
         X[t_index, v_index, z_index] = torch.from_numpy(
             df[
                 [
-                    "s",
+                    s_col,
                     "s_velocity",
                     "s_accel",
                     "d",
@@ -310,7 +311,7 @@ class IMF:
         )
 
         P[t_index, v_index, z_index] = torch.from_numpy(
-            df["P_CALK"].to_numpy().copy().reshape(-1, 6, 6).astype(np.float32)
+            df["P"].to_numpy().copy().reshape(-1, 6, 6).astype(np.float32)
         )
 
         # adding additional process noise to the length of the vehicle
@@ -349,12 +350,12 @@ class IMF:
             x_t = self.X[t]
             p_t = self.P[t]
 
-            F = CALKFilter.F_static(
+            F = CVLKFilter.F_static(
                 dt_vect=self.Dt[t],
                 shape=(self.v_dim, self.z_dim, self.x_dim, self.x_dim),
             ).to(self.device)
 
-            Q = CALKFilter.Q_static(
+            Q = CVLKFilter.Q_static(
                 dt_vect=self.Dt[t],
                 shape=(self.v_dim, self.z_dim, self.x_dim, self.x_dim),
             ).to(self.device)
@@ -453,6 +454,7 @@ class CI(IMF):
     def apply_filter(self) -> None:
         # CALKFilter.w_d = 1
         # CALKFilter.w_s = 2
+        # CALKFilter.w_s = 0.1
 
         R = build_r_matrix().to(self.device)
         H = build_h_matrix().to(self.device)
@@ -461,36 +463,36 @@ class CI(IMF):
             x_t = self.X[t]
             p_t = self.P[t]
 
-            F = CALKFilter.F_static(
+            F = CALCFilter.F_static(
                 dt_vect=self.Dt[t, :, 0],
                 shape=(self.v_dim, self.x_dim, self.x_dim),
             ).to(self.device)
 
-            Q = CALKFilter.Q_static(
-                dt_vect=self.Dt[t, :, 0],
-                shape=(self.v_dim, self.x_dim, self.x_dim),
-            ).to(self.device)
+            # Q = CALCFilter.Q_static(
+            #     dt_vect=self.Dt[t, :, 0],
+            #     shape=(self.v_dim, self.x_dim, self.x_dim),
+            # ).to(self.device)
 
             self.X_hat[t] = (F @ self.X_hat[t - 1,].unsqueeze(-1)).squeeze()
-            self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2) + Q
+            self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2) #+ Q
             # do the recursive update
             for z in range(self.z_dim):
                 mask = x_t[:, z].abs().sum(axis=-1) > 0.1
 
-                if z > 0:
-                    # only gate measurements that are > index 0
-                    S = H @ self.P_hat[t, mask] @ H.T + R
-                    z_error = ((x_t[mask, z, :] - self.X_hat[t, mask]) @ H.T).unsqueeze(
-                        -1
-                    )
-                    # calculate the maha distance and gate it
-                    m_sq = (
-                        z_error.transpose(-1, -2) @ torch.pinverse(S) @ z_error
-                    ).squeeze()
+                # if z > 0:
+                #     # only gate measurements that are > index 0
+                #     S = H @ self.P_hat[t, mask] @ H.T + R
+                #     z_error = ((x_t[mask, z, :] - self.X_hat[t, mask]) @ H.T).unsqueeze(
+                #         -1
+                #     )
+                #     # calculate the maha distance and gate it
+                #     m_sq = (
+                #         z_error.transpose(-1, -2) @ torch.pinverse(S) @ z_error
+                #     ).squeeze()
 
-                    # IDK if more expensive to clone the mask
-                    # or to do the indexing. Going with Clone cause lazy
-                    mask[mask.clone()] &= m_sq < chi2.ppf(0.99, 4)
+                #     # IDK if more expensive to clone the mask
+                #     # or to do the indexing. Going with Clone cause lazy
+                #     mask[mask.clone()] &= m_sq < chi2.ppf(0.90, 4)
 
                 omega = trace(p_t[mask, z]) / (
                     trace(self.P_hat[t, mask]) + trace(p_t[mask, z])
@@ -550,7 +552,7 @@ def batch_join(
                 (pl.col("vehicle_id_int") - offset).alias("vehicle_id_int")
             )
 
-            imf: Union[IMF, CI] = filter_cls(chunk_df, gpu=gpu)
+            imf: Union[IMF, CI] = filter_cls(chunk_df, gpu=gpu, s_col=s_col)
             imf.apply_filter()
 
             dfs.append(
@@ -705,8 +707,8 @@ def _inner_rts(
         chunk_df["time_diff"].to_numpy().copy().astype(np.float32)
     ).to(device)
 
-    CALKFilter.w_s = 5
-    CALKFilter.w_d = 2
+    # CALKFilter.w_s = 6
+    # CALKFilter.w_d = 10
 
     X_smooth, _ = CALKFilter.rts_smoother(
         X,

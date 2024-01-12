@@ -12,12 +12,23 @@ def plot_vehicle(
     color: str = "red",
     fig: go.Figure = None,
     data_name: str = None,
+    show_d = True,
 ) -> go.Figure:
     
+    if show_d:
+        specs = [
+            [{"secondary_y": True}],
+            [{"secondary_y": True}],
+        ]
+    else:
+        specs = [
+            [{"secondary_y": True}],
+        ] 
+
 
     if fig is None:
         fig = make_subplots(
-            rows=2,
+            rows=2 if show_d else 1,
             cols=1,
             shared_xaxes=True,
             vertical_spacing=0.02,
@@ -26,20 +37,16 @@ def plot_vehicle(
             #     "Vehicle S",
             # ),
             # add a secondary y axis to the velocity plots
-            specs=[
-                [{"secondary_y": True}],
-                [{"secondary_y": True}],
-                # [{"secondary_y": False}],
-            ],
+            specs=specs,
         )
 
-    for i, (name, col, secondary_y) in enumerate(
-        [
+    setup = [
             ("s", s_col, False),
             ("s_velocity", s_velocity_col, True),
-            ("d", d_col, False),
-            ("d_velocity", d_velocity_col, True),
-        ]
+        ] + ([("d", d_col, False), ("d_velocity", d_velocity_col, True)] if show_d else [])
+
+    for i, (name, col, secondary_y) in enumerate(
+        setup
     ):
         fig.add_trace(
             go.Scatter(

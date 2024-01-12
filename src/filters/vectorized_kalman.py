@@ -101,9 +101,9 @@ class _VectorizedKalmanFilter:
     x_dim = 6
     z_dim = 4
 
-    P_mod = 100
+    P_mod = 10
 
-    w_s = 1
+    w_s = 4
     w_d = 0.5
 
     stop_speed_threshold = 0.5
@@ -493,7 +493,7 @@ class _VectorizedKalmanFilter:
 
 
 class CALKFilter(_VectorizedKalmanFilter):
-    w_s = 1
+    w_s = 8
     w_d = 0.5
 
     def __init__(
@@ -605,7 +605,7 @@ class CALKFilter(_VectorizedKalmanFilter):
 
 
 class CVLKFilter(_VectorizedKalmanFilter):
-    w_s = 1
+    w_s = 8
     w_d = 0.5
 
     def __init__(
@@ -620,10 +620,19 @@ class CVLKFilter(_VectorizedKalmanFilter):
         super().__init__(df, z, dt, predict_mask, inds, **kwargs)
 
     def F(self, t_ind: int) -> TensorType["vehicle", "x_dim", "x_dim"]:
-        F = torch.zeros((self.v_dim, self.x_dim, self.x_dim), device=self._dt.device)
+        return self.F_static(
+            self._dt[t_ind],
+            (self.v_dim, self.x_dim, self.x_dim),
+        ).to(self._device)
 
+    @staticmethod
+    def F_static(
+        dt_vect: int, shape: Tuple[int, ...]
+    ) -> TensorType["vehicle", "x_dim", "x_dim"]:
+        F = torch.zeros(shape)
+        
         F[:, 0, 0] = 1
-        F[:, 0, 1] = self._dt[t_ind]
+        F[:, 0, 1] = dt_vect
         F[:, 1, 1] = 1
         F[:, 3, 3] = 1
         return F
@@ -663,7 +672,7 @@ class CVLKFilter(_VectorizedKalmanFilter):
 
 
 class CALCFilter(_VectorizedKalmanFilter):
-    w_s = 1
+    w_s = 8
     w_d = 0.5
 
     def __init__(
