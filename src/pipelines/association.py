@@ -255,8 +255,7 @@ def pipe_gate_headway_calc(
         .agg(
             pl.col("association_distance")
             .ewm_mean(alpha=alpha)
-            # .last()
-            .quantile(0.25)
+            .min()
             .alias("association_distance_filt"),
             pl.col("epoch_time").first().alias("epoch_time"),
             pl.col("prediction").any().alias("prediction"),
@@ -306,8 +305,8 @@ def build_match_df(
         )
         .filter(
             pl.when(~(pl.col("prediction") | pl.col("prediction_leader")))
-            .then(pl.col("association_distance_filt") < assoc_cutoff)
-            .otherwise(pl.col("association_distance_filt") < assoc_cutoff_pred)
+            .then(pl.col("association_distance_filt") <= assoc_cutoff)
+            .otherwise(pl.col("association_distance_filt") <= assoc_cutoff_pred)
         )
         .sort("value", "epoch_time")
         .with_columns(

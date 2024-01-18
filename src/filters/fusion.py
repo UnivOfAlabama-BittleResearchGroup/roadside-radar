@@ -140,9 +140,7 @@ def association_loglikelihood_distance(
     device = pick_device(gpu)
 
     H = build_h_matrix().to(device)
-    R = build_r_matrix().to(device)
-
-    R[0,0] = 3
+    R = build_r_matrix(pos_error=2.5).to(device)
 
     P = torch.from_numpy(
         df["P_leader"]
@@ -203,7 +201,7 @@ def association_loglikelihood_distance(
     d, _ = d.min(axis=-1)
     d[
         torch.isnan(d)
-    ] = 1  # replace nan with 1 (this happens when the determinant is near 0)
+    ] = 1  # replace nan with 0 (this happens when the determinant is near 0)
 
     return df.with_columns(
         [

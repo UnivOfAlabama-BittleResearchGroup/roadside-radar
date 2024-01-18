@@ -47,11 +47,14 @@ def plot_time_space(
         color = color_func(veh_df, i)
 
         # for obj_id, obj_df in veh_df.groupby(["object_id"]):
+        
+        veh_df = veh_df.sort_values("epoch_time")
+        veh_df = veh_df.iloc[::every, :]
 
         p_df = veh_df.loc[veh_df["prediction"] == True]
         np_df = veh_df.loc[veh_df["prediction"] == False]
 
-        veh_df = veh_df.iloc[::every, :]
+        
 
         if len(p_df) > 0:
             fig.add_trace(

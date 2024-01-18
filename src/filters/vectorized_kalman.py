@@ -34,7 +34,7 @@ def build_h_matrix() -> FloatTensor:
     )
 
 
-def build_r_matrix() -> FloatTensor:
+def build_r_matrix(pos_error: float = 0.5) -> FloatTensor:
     """
     Build the R matrix for the Kalman filter
 
@@ -46,7 +46,7 @@ def build_r_matrix() -> FloatTensor:
     return torch.Tensor(
         np.array(
             [
-                [0.5 + discretization_error, 0, 0, 0],
+                [pos_error + discretization_error, 0, 0, 0],
                 [0, 0.5 + discretization_error, 0, 0],
                 [0, 0, 0.5 + discretization_error, 0],
                 [0, 0, 0, 0.5 + discretization_error],
@@ -104,7 +104,7 @@ class _VectorizedKalmanFilter:
 
     P_mod = 10
 
-    w_s = 10
+    w_s = 8
     w_d = 1
 
     stop_speed_threshold = 0.5
@@ -1098,9 +1098,6 @@ def batch_imm_df(
     chunk_size: int = 10_000,
 ) -> pl.DataFrame:
     import pyarrow as pa
-
-    # find the total number of vehicles
-    v_max = df["vehicle_ind"].max()
 
     filts = []
 
