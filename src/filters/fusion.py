@@ -17,67 +17,67 @@ from src.filters.vectorized_kalman import (
 )
 
 
-def create_z_matrices(df, Z_followers, Z_leaders):
-    positions = ["s", "front_s", "back_s"]
-    # Create all combinations of leader and follower positions
-    for follower_pos, leader_pos in permutations(positions, 2):
-        follower_col = [
-            f"{follower_pos}",
-            "s_velocity",
-            "d",
-            "d_velocity",
-        ]
-        leader_col = [
-            f"{leader_pos}_leader",
-            "s_velocity_leader",
-            "d_leader",
-            "d_velocity_leader",
-        ]
-
-        # Append follower data to Z_followers
-        Z_followers.append(
-            torch.from_numpy(
-                df[follower_col]
-                .to_numpy()
-                .copy()
-                .reshape(-1, 4, 1)
-                .astype(dtype=np.float32),
-            )
-        )
-
-        # Append leader data to Z_leaders
-        Z_leaders.append(
-            torch.from_numpy(
-                df[leader_col]
-                .to_numpy()
-                .copy()
-                .reshape(-1, 4, 1)
-                .astype(dtype=np.float32),
-            )
-        )
-
-
 # def create_z_matrices(df, Z_followers, Z_leaders):
-#     for pos in ["s", "front_s", "back_s"]:
-#         for ext, l in zip(["_leader", ""], [Z_leaders, Z_followers]):
-#             l.append(
-#                 torch.from_numpy(
-#                     df[
-#                         [
-#                             f"{pos}{ext}",
-#                             f"s_velocity{ext}",
-#                             f"d{ext}",
-#                             f"d_velocity{ext}",
-#                         ]
-#                     ]
-#                     .to_numpy()
-#                     .copy()
-#                     .reshape(-1, 4, 1)
-#                     .astype(
-#                         dtype=np.float32,
-#                     ),
-#                 )
+#     positions = ["s", "front_s", "back_s"]
+#     # Create all combinations of leader and follower positions
+#     for follower_pos, leader_pos in permutations(positions, 2):
+#         follower_col = [
+#             f"{follower_pos}",
+#             "s_velocity",
+#             "d",
+#             "d_velocity",
+#         ]
+#         leader_col = [
+#             f"{leader_pos}_leader",
+#             "s_velocity_leader",
+#             "d_leader",
+#             "d_velocity_leader",
+#         ]
+
+#         # Append follower data to Z_followers
+#         Z_followers.append(
+#             torch.from_numpy(
+#                 df[follower_col]
+#                 .to_numpy()
+#                 .copy()
+#                 .reshape(-1, 4, 1)
+#                 .astype(dtype=np.float32),
 #             )
+#         )
+
+#         # Append leader data to Z_leaders
+#         Z_leaders.append(
+#             torch.from_numpy(
+#                 df[leader_col]
+#                 .to_numpy()
+#                 .copy()
+#                 .reshape(-1, 4, 1)
+#                 .astype(dtype=np.float32),
+#             )
+#         )
+
+
+def create_z_matrices(df, Z_followers, Z_leaders):
+    for pos in ["s", "front_s", "back_s"]:
+        for ext, l in zip(["_leader", ""], [Z_leaders, Z_followers]):
+            l.append(
+                torch.from_numpy(
+                    df[
+                        [
+                            f"{pos}{ext}",
+                            f"s_velocity{ext}",
+                            f"d{ext}",
+                            f"d_velocity{ext}",
+                        ]
+                    ]
+                    .to_numpy()
+                    .copy()
+                    .reshape(-1, 4, 1)
+                    .astype(
+                        dtype=np.float32,
+                    ),
+                )
+            )
 
 
 def loglikelihood(
@@ -142,6 +142,8 @@ def association_loglikelihood_distance(
     H = build_h_matrix().to(device)
     R = build_r_matrix().to(device)
 
+    R[0,0] = 3
+
     P = torch.from_numpy(
         df["P_leader"]
         .to_numpy()
@@ -189,16 +191,19 @@ def association_loglikelihood_distance(
 
     d = (
         (
-            Z_error.transpose(-1, -2) @ torch.pinverse(S)[..., None, :, :] @ Z_error
+            Z_error.transpose(-1, -2)
+            @ torch.linalg.pinv(S, hermitian=True)[..., None, :, :]
+            @ Z_error
         ).squeeze()
-        + torch.log(torch.det(S))[..., None]
+        + torch.logdet(S)[..., None]
         # + dims * torch.log(torch.tensor(2 * np.pi, dtype=torch.float32, device=device))
         # + two_pi
     ).sqrt()
 
     d, _ = d.min(axis=-1)
-    d[torch.isnan(d)] = 1  # replace nan with 1 (this happens when the determinant is near 0)
-
+    d[
+        torch.isnan(d)
+    ] = 1  # replace nan with 1 (this happens when the determinant is near 0)
 
     return df.with_columns(
         [
@@ -272,7 +277,7 @@ def mahalanobis_distance(
 
 
 class IMF:
-    def __init__(self, df: pl.DataFrame, gpu: bool = True, s_col: str = 's') -> None:
+    def __init__(self, df: pl.DataFrame, gpu: bool = True, s_col: str = "s") -> None:
         # create dimensions of everything
         self.t_dim = df["time_index"].max() + 1
         self.v_dim = df["vehicle_id_int"].max() + 1
@@ -350,12 +355,12 @@ class IMF:
             x_t = self.X[t]
             p_t = self.P[t]
 
-            F = CVLKFilter.F_static(
+            F = CALCFilter.F_static(
                 dt_vect=self.Dt[t],
                 shape=(self.v_dim, self.z_dim, self.x_dim, self.x_dim),
             ).to(self.device)
 
-            Q = CVLKFilter.Q_static(
+            Q = CALCFilter.Q_static(
                 dt_vect=self.Dt[t],
                 shape=(self.v_dim, self.z_dim, self.x_dim, self.x_dim),
             ).to(self.device)
@@ -364,12 +369,12 @@ class IMF:
 
             p_hat_t_t1 = (
                 F[..., 0, :, :] @ self.P_hat[t - 1,] @ F[..., 0, :, :].transpose(-1, -2)
-                + Q[..., 0, :, :]
+                # + Q[..., 0, :, :]
             )
 
             # predict the individual measurements
             x_t_t1 = (F @ self.X[t - 1].unsqueeze(-1)).squeeze()
-            p_t_t1 = F @ self.P[t - 1] @ F.transpose(-1, -2) + Q
+            p_t_t1 = F @ self.P[t - 1] @ F.transpose(-1, -2)  # + Q
 
             # precompute the inverse
             p_hat_t_t1_i = torch.pinverse(p_hat_t_t1)
@@ -443,8 +448,12 @@ class IMF:
         torch.cuda.empty_cache()
 
 
-def trace(tesnor: torch.Tensor) -> torch.Tensor:
-    return tesnor.diagonal(dim1=-2, dim2=-1).sum(-1)
+def trace(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.diagonal(dim1=-2, dim2=-1).sum(-1)
+
+
+def determinant(tesnor: torch.Tensor) -> torch.Tensor:
+    return torch.linalg.det(tesnor)
 
 
 class CI(IMF):
@@ -461,20 +470,22 @@ class CI(IMF):
 
         for t in tqdm(range(1, self.t_dim)):
             x_t = self.X[t]
-            p_t = self.P[t]
+            p_t = self.P[
+                t
+            ]  # + torch.eye(self.x_dim, dtype=torch.float32).to(self.device)
 
             F = CALCFilter.F_static(
                 dt_vect=self.Dt[t, :, 0],
                 shape=(self.v_dim, self.x_dim, self.x_dim),
             ).to(self.device)
 
-            # Q = CALCFilter.Q_static(
-            #     dt_vect=self.Dt[t, :, 0],
-            #     shape=(self.v_dim, self.x_dim, self.x_dim),
-            # ).to(self.device)
+            Q = CALCFilter.Q_static(
+                dt_vect=self.Dt[t, :, 0],
+                shape=(self.v_dim, self.x_dim, self.x_dim),
+            ).to(self.device)
 
             self.X_hat[t] = (F @ self.X_hat[t - 1,].unsqueeze(-1)).squeeze()
-            self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2) #+ Q
+            self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2) + Q
             # do the recursive update
             for z in range(self.z_dim):
                 mask = x_t[:, z].abs().sum(axis=-1) > 0.1
@@ -492,15 +503,65 @@ class CI(IMF):
 
                 #     # IDK if more expensive to clone the mask
                 #     # or to do the indexing. Going with Clone cause lazy
-                #     mask[mask.clone()] &= m_sq < chi2.ppf(0.90, 4)
+                #     mask[mask.clone()] &= m_sq < chi2.ppf(0.99, 4)
 
-                omega = trace(p_t[mask, z]) / (
-                    trace(self.P_hat[t, mask]) + trace(p_t[mask, z])
+                omega = determinant(p_t[mask, z]) / (
+                    determinant(self.P_hat[t, mask]) + determinant(p_t[mask, z])
                 )
-                a1 = omega[..., None, None] * torch.pinverse(self.P_hat[t, mask])
-                a2 = (1 - omega[..., None, None]) * torch.pinverse(p_t[mask, z])
+                # clip omega to (0, 1)
 
-                self.P_hat[t, mask] = torch.pinverse(a1 + a2)
+                # a1 = torch.linalg.lstsq()
+
+                a1 = omega[..., None, None] * torch.linalg.pinv(
+                    self.P_hat[t, mask], hermitian=True
+                )
+                a2 = (1 - omega[..., None, None]) * torch.linalg.pinv(
+                    p_t[mask, z], hermitian=True
+                )
+
+                self.P_hat[t, mask] = torch.linalg.pinv(a1 + a2, hermitian=True)
+                self.X_hat[t, mask] = (
+                    self.P_hat[t, mask]
+                    @ (
+                        a1 @ self.X_hat[t, mask].unsqueeze(-1)
+                        + a2 @ x_t[mask, z].unsqueeze(-1)
+                    )
+                ).squeeze()
+
+
+class ImprovedFastCI(IMF):
+    #  from https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=1591849
+
+    def apply_filter(self) -> None:
+        for t in tqdm(range(1, self.t_dim)):
+            x_t = self.X[t]
+            p_t = self.P[t]
+
+            F = CALCFilter.F_static(
+                dt_vect=self.Dt[t, :, 0],
+                shape=(self.v_dim, self.x_dim, self.x_dim),
+            ).to(self.device)
+
+            Q = CALCFilter.Q_static(
+                dt_vect=self.Dt[t, :, 0],
+                shape=(self.v_dim, self.x_dim, self.x_dim),
+            ).to(self.device)
+
+            self.X_hat[t] = (F @ self.X_hat[t - 1,].unsqueeze(-1)).squeeze()
+            self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2) + Q
+
+            for z in range(self.z_dim):
+                mask = x_t[:, z].abs().sum(axis=-1) > 0.1
+
+                I_i = torch.linalg.pinv(p_t[mask, z], hermitian=True)
+                I_hat = torch.linalg.pinv(self.P_hat[t, mask], hermitian=True)
+                d_i = determinant(I_hat + I_i)
+                omega = (d_i - determinant(I_i) + determinant(I_hat)) / (2 * d_i)
+
+                a1 = omega[..., None, None] * I_hat
+                a2 = (1 - omega[..., None, None]) * I_i
+
+                self.P_hat[t, mask] = torch.linalg.pinv(a1 + a2, hermitian=True)
                 self.X_hat[t, mask] = (
                     self.P_hat[t, mask]
                     @ (
@@ -676,7 +737,7 @@ def _inner_rts(
         dtype=torch.float32,
     ).to(device)
 
-    X[t_inds, v_inds] = torch.from_numpy(
+    x_block = (
         chunk_df[
             [
                 f"ci_{s_col}",
@@ -688,9 +749,10 @@ def _inner_rts(
             ]
         ]
         .cast(pl.Float32)
-        .to_numpy()
-        .copy()
-    ).to(device)
+        .to_numpy(use_pyarrow=True)
+    )
+
+    X[t_inds, v_inds] = torch.from_numpy(x_block.copy()).to(device)
 
     P = torch.zeros(
         (t_dim, v_dim, 6, 6),
@@ -707,10 +769,7 @@ def _inner_rts(
         chunk_df["time_diff"].to_numpy().copy().astype(np.float32)
     ).to(device)
 
-    # CALKFilter.w_s = 6
-    # CALKFilter.w_d = 10
-
-    X_smooth, _ = CALKFilter.rts_smoother(
+    X_smooth, _ = CALCFilter.rts_smoother(
         X,
         P,
         Dts,

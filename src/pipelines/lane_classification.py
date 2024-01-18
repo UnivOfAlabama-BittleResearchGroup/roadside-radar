@@ -68,9 +68,16 @@ def label_lanes_tree(
     kalman_network: RoadNetwork,
     lane_width: float,
     s_col: str = "s",
+    time_col: str = "epoch_time",
 ) -> pl.DataFrame:
+
+
+
+
+
     return (
-        df.lazy()
+        df
+        # .lazy()
         .sort(s_col)
         .join_asof(
             kalman_network.map_to_lane(
@@ -80,7 +87,7 @@ def label_lanes_tree(
                 utm_x_col="x",
                 utm_y_col="y",
             )
-            .lazy()
+            # .lazy()
             .with_columns(
                 (pl.col("d") / 2).alias("d_cutoff"),
                 pl.col("s_lane").cast(pl.Float32),
@@ -91,7 +98,7 @@ def label_lanes_tree(
             left_on=s_col,
             right_on="s_lane",
             strategy="nearest",
-            tolerance=kalman_network.step_size,
+            tolerance=kalman_network.step_size * 2,
             by_left="lane",
             by_right="name_lane",
         )
@@ -100,7 +107,7 @@ def label_lanes_tree(
             pl.col("d_other_center").forward_fill().over("lane"),
             pl.lit(None, dtype=pl.UInt16).alias("lane_index"),
         )
-        .drop("s_lane", "name_lane")
+        # .drop("s_lane", "name_lane")
         .with_columns(
             pl.when(pl.col("d") < pl.col("d_cutoff"))
             .then(
@@ -115,7 +122,7 @@ def label_lanes_tree(
             )
             .alias("lane_index")
         )
-        .sort("epoch_time")
-        .set_sorted('epoch_time')
-        .collect(streaming=True)
+        .sort(time_col)
+        .set_sorted(time_col)
+        # .collect(streaming=True)
     )

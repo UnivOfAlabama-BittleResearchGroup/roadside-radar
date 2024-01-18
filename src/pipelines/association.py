@@ -8,7 +8,10 @@ from src.pipelines.utils import lazify, timeit
 @lazify
 @timeit
 def add_front_back_s(
-    df: pl.DataFrame, use_median_length: bool = True, s_col: str = "s"
+    df: pl.DataFrame,
+    use_median_length: bool = False,
+    use_nearest_length: bool = False,
+    s_col: str = "s",
 ) -> pl.DataFrame:
     required_columns = {s_col, "distanceToFront_s", "distanceToBack_s", "length_s"}
     assert required_columns.issubset(
@@ -32,21 +35,67 @@ def add_front_back_s(
         #     )
         #     .drop(["median_length_s", "front_percent", "back_percent"])
         # )
-    if 'front' in s_col:
+
+    if use_nearest_length:
+        # if approaching, we can assume that the distanceToFront_s is right,
+        # and the back is found by subtracting the length
+        # the length is found by taking the reading that is closest to the radar.
+        assert "dist" in df.columns, 'Must have "dist" column'
+        assert "approaching" in df.columns, 'Must have "approaching" column'
+        return (
+            df.with_columns(
+                pl.col("length_s")
+                .sort_by(pl.col("dist"))
+                .first()
+                .over("object_id")
+                .alias("nearest_length_s"),
+            )
+            .with_columns(
+                pl.when(pl.col("approaching"))
+                .then(pl.col("distanceToFront_s") + pl.col(s_col))
+                .otherwise(
+                    (
+                        pl.col("distanceToBack_s")
+                        + pl.col(s_col)
+                        + pl.col("nearest_length_s")
+                    )
+                )
+                .alias("front_s"),
+                pl.when(pl.col("approaching"))
+                .then(
+                    (
+                        pl.col("distanceToFront_s")
+                        + pl.col(s_col)
+                        - pl.col("nearest_length_s")
+                    )
+                )
+                .otherwise(pl.col("distanceToBack_s") + pl.col(s_col))
+                .alias("back_s"),
+            )
+            .drop("nearest_length_s")
+        )
+
+    if "front" in s_col:
         return df.with_columns(
             # centroid
             (pl.col(s_col) - pl.col("distanceToFront_s")).alias("s"),
-            # back 
-            (pl.col(s_col) - pl.max_horizontal(pl.col("length_s"), pl.col('distanceToFront_s') + -1 * pl.col('distanceToBack_s'))).alias("back_s"),
+            # back
+            (
+                pl.col(s_col)
+                - pl.max_horizontal(
+                    pl.col("length_s"),
+                    pl.col("distanceToFront_s") + -1 * pl.col("distanceToBack_s"),
+                )
+            ).alias("back_s"),
         )
-    elif s_col == 's':
+    elif s_col == "s":
         return df.with_columns(
             (pl.col(s_col) + (pl.col("distanceToFront_s")))
             # .clip_min(pl.col(s_col))
             .alias("front_s"),
             # distance to back is negative
             (pl.col(s_col) + (pl.col("distanceToBack_s")))
-            .clip_max(pl.col(s_col))
+            # .clip_max(pl.col(s_col))
             .alias("back_s"),
         )
     else:
@@ -55,10 +104,10 @@ def add_front_back_s(
 
 @timeit
 @lazify
-def build_leader_follower_df(df: pl.DataFrame, s_col: str = 's') -> pl.DataFrame:
+def build_leader_follower_df(df: pl.DataFrame, s_col: str = "s") -> pl.DataFrame:
     if s_col not in {"s", "front_s", "back_s"}:
         raise ValueError("s_col must be one of {'s', 'front_s', 'back_s'}")
-    
+
     keep_cols = [
         "s",
         "front_s",
@@ -196,7 +245,7 @@ def calculate_match_indexes(
 @lazify
 def pipe_gate_headway_calc(
     df: pl.DataFrame,
-    alpha: float = 0.1,
+    alpha: float = 0.9,
 ) -> pl.DataFrame:
     return (
         df.lazy()
@@ -205,9 +254,9 @@ def pipe_gate_headway_calc(
         )
         .agg(
             pl.col("association_distance")
-            # .ewm_mean(alpha=alpha)
+            .ewm_mean(alpha=alpha)
             # .last()
-            .min()
+            .quantile(0.25)
             .alias("association_distance_filt"),
             pl.col("epoch_time").first().alias("epoch_time"),
             pl.col("prediction").any().alias("prediction"),
@@ -352,8 +401,8 @@ def create_vehicle_ids(
 @lazify
 def build_fusion_df(
     df: pl.DataFrame,
-    speed_threshold: float = 0.5,
     max_vehicle_num: int = 3,
+    prediction_length: float = 4,
 ) -> pl.DataFrame:
     ci_df = (
         df.lazy()
@@ -363,16 +412,18 @@ def build_fusion_df(
         )
         # sort by the start time
         .sort(["epoch_time", "start_time"])
-        # .with_columns(
-        #     # count the number of times the object has been seen
-        #     cumtime=pl.col("epoch_time").cum_count().over("object_id"),
-        #     # count the number of measurements per vehicle-time
-        #     cumcount=pl.col("epoch_time").cum_count().over(["epoch_time", "vehicle_id"]),
-        #     # count the total number of measurements per vehicle
-        #     count=pl.col("epoch_time").count().over(["epoch_time", "vehicle_id"]),
-        # )
-        # # filter out the first measurement
-        # # .filter(~((pl.col("count") > 1) & (pl.col("cumtime") < 10)))
+        .with_columns(
+            # count the number of times the object has been seen
+            cumtime=pl.col("epoch_time").cum_count().over("object_id"),
+            # count the number of measurements per vehicle-time
+            cumcount=pl.col("epoch_time")
+            .cum_count()
+            .over(["epoch_time", "vehicle_id"]),
+            # count the total number of measurements per vehicle
+            count=pl.col("epoch_time").count().over(["epoch_time", "vehicle_id"]),
+        )
+        # # filter out the first second of measurements if the count > 0
+        .filter(~((pl.col("cumcount") >= 1) & (pl.col("cumtime") < 10)))
         .drop(["cumtime", "cumcount", "count"])
         .with_columns(
             # cumtime=pl.col("epoch_time").cum_count().over("object_id"),
@@ -381,28 +432,38 @@ def build_fusion_df(
             .over(["epoch_time", "vehicle_id"]),
             count=pl.col("epoch_time").count().over(["epoch_time", "vehicle_id"]),
         )
-        # .filter(
-        #     (
-        #         # remove kalman filter errors in the radar
-        #         ~((pl.col("count") > 1) & pl.col("prediction"))
-        #     )
-        # )
-        # .with_columns(
-        #     # count again after filtering
-        #     cumcount=pl.col("epoch_time").count().over(["epoch_time", "vehicle_id"]),
-        # )
+        .filter(
+            (
+                # remove kalman filter errors in the radar
+                ~((pl.col("cumcount") >= 1) & pl.col("prediction"))
+            )
+        )
+        .with_columns(
+            # count again after filtering
+            # cumcount=pl.col("epoch_time").count().over(["epoch_time", "vehicle_id"]),
+            timedelta=(pl.col("epoch_time").max() - pl.col("epoch_time"))
+            .dt.total_milliseconds()
+            .over("vehicle_id")
+        )
         # .filter(
         #     (~pl.col("prediction") | (pl.col("cumcount") > 1))
         # )
-        # .drop(["cumtime", "cumcount"])
+        .filter(
+            ~(
+                (pl.col("count") == 1)
+                & pl.col("prediction")
+                & (pl.col("timedelta") < prediction_length * 1e3)
+            )
+        )
+        .drop(["cumtime", "cumcount"])
         .collect()
     )
 
-    ci_df = ci_df.filter(
-        (
-            (pl.col("epoch_time").max() - pl.col("epoch_time")) > timedelta(seconds=4)
-        ).over("vehicle_id")
-    )
+    # ci_df = ci_df.filter(
+    #     (
+    #         (pl.col("epoch_time").max() - pl.col("epoch_time")) > timedelta(seconds=4)
+    #     ).over("vehicle_id")
+    # )
 
     ci_df = (
         ci_df.lazy()

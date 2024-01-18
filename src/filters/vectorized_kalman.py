@@ -4,6 +4,7 @@ import torch
 from torch import FloatTensor
 import numpy as np
 import polars as pl
+import gc
 
 # this is
 # ruff: noqa: F821
@@ -45,9 +46,9 @@ def build_r_matrix() -> FloatTensor:
     return torch.Tensor(
         np.array(
             [
-                [1 + discretization_error, 0, 0, 0],
+                [0.5 + discretization_error, 0, 0, 0],
                 [0, 0.5 + discretization_error, 0, 0],
-                [0, 0, 1 + discretization_error, 0],
+                [0, 0, 0.5 + discretization_error, 0],
                 [0, 0, 0, 0.5 + discretization_error],
             ]
         )
@@ -103,8 +104,8 @@ class _VectorizedKalmanFilter:
 
     P_mod = 10
 
-    w_s = 4
-    w_d = 0.5
+    w_s = 10
+    w_d = 1
 
     stop_speed_threshold = 0.5
 
@@ -484,7 +485,11 @@ class _VectorizedKalmanFilter:
 
             Pp = F_last @ Ps[k, mask] @ F_last.transpose(-1, -2) + Q_last
 
-            K = Ps[k, mask] @ F_last.transpose(-1, -2) @ torch.linalg.pinv(Pp)
+
+            # replace pinv with torch.linalg.lstsq(A, B).solution
+            # K = torch.linalg.lstsq(Ps[k, mask] @ F_last.transpose(-1, -2), torch.eye(dim_x, device=device)).solution
+            
+            K = Ps[k, mask] @ F_last.transpose(-1, -2) @ torch.linalg.pinv(Pp, hermitian=True)
 
             out_Xs[k, mask] += K @ (out_Xs[k + 1, mask] - F_last @ out_Xs[k, mask])
             Ps[k, mask] += K @ (Ps[k + 1, mask] - Pp) @ K.transpose(-1, -2)
@@ -493,8 +498,8 @@ class _VectorizedKalmanFilter:
 
 
 class CALKFilter(_VectorizedKalmanFilter):
-    w_s = 8
-    w_d = 0.5
+    w_s = 10
+    w_d = 1
 
     def __init__(
         self,
@@ -605,8 +610,8 @@ class CALKFilter(_VectorizedKalmanFilter):
 
 
 class CVLKFilter(_VectorizedKalmanFilter):
-    w_s = 8
-    w_d = 0.5
+    w_s = 10
+    w_d = 1
 
     def __init__(
         self,
@@ -672,8 +677,8 @@ class CVLKFilter(_VectorizedKalmanFilter):
 
 
 class CALCFilter(_VectorizedKalmanFilter):
-    w_s = 8
-    w_d = 0.5
+    w_s = 10
+    w_d = 1
 
     def __init__(
         self,
@@ -998,8 +1003,9 @@ class IMMFilter:
         PHT = P @ H.transpose(-1, -2)
         S = H @ PHT + R
         try:
-            SI = torch.inverse(
+            SI = torch.linalg.pinv(
                 S,
+                hermitian=True,
             )
         except RuntimeError as e:
             print(f"pinverse failed at time {t_ind}")
@@ -1076,7 +1082,9 @@ class IMMFilter:
         # cleanup all of the filters
         for f in self._filters:
             f.cleanup()
-
+        
+        self._filters = []
+        gc.collect()
         # clear the cache
         torch.cuda.empty_cache()
 
@@ -1089,7 +1097,6 @@ def batch_imm_df(
     gpu: bool = True,
     chunk_size: int = 10_000,
 ) -> pl.DataFrame:
-    import gc
     import pyarrow as pa
 
     # find the total number of vehicles
@@ -1162,9 +1169,8 @@ def batch_imm_df(
             )
         )
 
-        # imm.cleanup()
+        imm.cleanup()
         del imm
-
         gc.collect()
         torch.cuda.empty_cache()
 

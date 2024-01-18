@@ -14,7 +14,8 @@ def plot_time_space(
     marker_func: callable = None,
     hoverdata: str = None,
     vehicle_col: str = "vehicle_id",
-    **kwargs
+    every: int = 1,
+    **kwargs,
 ):
     colors = px.colors.qualitative.D3
 
@@ -50,8 +51,9 @@ def plot_time_space(
         p_df = veh_df.loc[veh_df["prediction"] == True]
         np_df = veh_df.loc[veh_df["prediction"] == False]
 
-        if len(p_df) > 0:
+        veh_df = veh_df.iloc[::every, :]
 
+        if len(p_df) > 0:
             fig.add_trace(
                 go.Scatter(
                     x=p_df["epoch_time_cst"],
