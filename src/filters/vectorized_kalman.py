@@ -102,9 +102,9 @@ class _VectorizedKalmanFilter:
     x_dim = 6
     z_dim = 4
 
-    P_mod = 10
+    P_mod = 1
 
-    w_s = 8
+    w_s = np.sqrt(8)
     w_d = 1
 
     stop_speed_threshold = 0.5
@@ -1127,8 +1127,8 @@ def batch_imm_df(
         v_index = np.tile(np.arange(imm.v_dim), imm.t_dim) + offset
         x_filt = x_filt.reshape(-1, imm.x_dim)
         p_filt = p_filt.reshape(-1, imm.x_dim, imm.x_dim)
-        p_calk = (
-            tuple(filter(lambda f: isinstance(f, CALKFilter), imm._filters))[0]
+        p_calc = (
+            tuple(filter(lambda f: isinstance(f, CALCFilter), imm._filters))[0]
             .P
             # .detach()
             .cpu()
@@ -1150,8 +1150,8 @@ def batch_imm_df(
                     "P": pa.FixedSizeListArray.from_arrays(
                         p_filt.reshape(-1), imm.x_dim * imm.x_dim
                     ),
-                    "P_CALK": pa.FixedSizeListArray.from_arrays(
-                        p_calk.reshape(-1), imm.x_dim * imm.x_dim
+                    "P_CALC": pa.FixedSizeListArray.from_arrays(
+                        p_calc.reshape(-1), imm.x_dim * imm.x_dim
                     ),
                     **{
                         f"mu_{f}": mu_filt[:, i]

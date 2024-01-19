@@ -420,30 +420,36 @@ def build_fusion_df(
             .over(["epoch_time", "vehicle_id"]),
             # count the total number of measurements per vehicle
             count=pl.col("epoch_time").count().over(["epoch_time", "vehicle_id"]),
-        )
-        # # filter out the first second of measurements if the count > 0
-        .filter(~((pl.col("cumcount") >= 1) & (pl.col("cumtime") < 10)))
-        .drop(["cumtime", "cumcount", "count"])
-        .with_columns(
-            # cumtime=pl.col("epoch_time").cum_count().over("object_id"),
-            cumcount=pl.col("epoch_time")
-            .cum_count()
-            .over(["epoch_time", "vehicle_id"]),
-            count=pl.col("epoch_time").count().over(["epoch_time", "vehicle_id"]),
-        )
-        .filter(
-            (
-                # remove kalman filter errors in the radar
-                ~((pl.col("cumcount") >= 1) & pl.col("prediction"))
-            )
-        )
-        .with_columns(
-            # count again after filtering
-            # cumcount=pl.col("epoch_time").count().over(["epoch_time", "vehicle_id"]),
             timedelta=(pl.col("epoch_time").max() - pl.col("epoch_time"))
             .dt.total_milliseconds()
             .over("vehicle_id")
         )
+        # # filter out the first second of measurements if the count > 0
+        # .filter(~((pl.col("cumcount") >= 1) & (pl.col("cumtime") < 10)))
+        # .drop(["cumtime", "cumcount", "count"])
+        # .with_columns(
+        #     # cumtime=pl.col("epoch_time").cum_count().over("object_id"),
+        #     cumcount=pl.col("epoch_time")
+        #     .cum_count()
+        #     .over(["epoch_time", "vehicle_id"]),
+        #     count=pl.col("epoch_time").count().over(["epoch_time", "vehicle_id"]),
+        # )
+        .filter(
+            (
+                # remove kalman filter errors in the radar
+                ~((pl.col("count") > 1) & pl.col("prediction"))
+            )
+        )
+        # .filter(
+        #     (
+        #         ~((pl.col('count') > 1) & pl.col('prediction'))
+        #     )
+        # )
+        # .with_columns(
+        #     # count again after filtering
+        #     # cumcount=pl.col("epoch_time").count().over(["epoch_time", "vehicle_id"]),
+            
+        # )
         # .filter(
         #     (~pl.col("prediction") | (pl.col("cumcount") > 1))
         # )

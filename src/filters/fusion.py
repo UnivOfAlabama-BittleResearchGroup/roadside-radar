@@ -367,17 +367,17 @@ class IMF:
 
             p_hat_t_t1 = (
                 F[..., 0, :, :] @ self.P_hat[t - 1,] @ F[..., 0, :, :].transpose(-1, -2)
-                # + Q[..., 0, :, :]
+                + Q[..., 0, :, :]
             )
 
             # predict the individual measurements
             x_t_t1 = (F @ self.X[t - 1].unsqueeze(-1)).squeeze()
-            p_t_t1 = F @ self.P[t - 1] @ F.transpose(-1, -2)  # + Q
+            p_t_t1 = F @ self.P[t - 1] @ F.transpose(-1, -2) + Q
 
             # precompute the inverse
-            p_hat_t_t1_i = torch.pinverse(p_hat_t_t1)
-            p_t_i = torch.pinverse(p_t)
-            p_t_t1_i = torch.pinverse(p_t_t1)
+            p_hat_t_t1_i = torch.linalg.pinv(p_hat_t_t1, hermitian=True)
+            p_t_i = torch.linalg.pinv(p_t, hermitian=True)
+            p_t_t1_i = torch.linalg.pinv(p_t_t1, hermitian=True)
 
             inner_p = torch.zeros(
                 (self.v_dim, self.x_dim, self.x_dim), dtype=torch.float32
@@ -400,7 +400,7 @@ class IMF:
                 )
 
             p_main_inv = p_hat_t_t1_i + inner_p
-            p_hat_t_t = torch.pinverse(p_main_inv)
+            p_hat_t_t = torch.linalg.pinv(p_main_inv, hermitian=True)
             x_hat_t_t = p_hat_t_t @ (p_hat_t_t1_i @ x_hat_t_t1.unsqueeze(-1) + inner_x)
 
             self.X_hat[t] = x_hat_t_t.squeeze()
@@ -485,7 +485,11 @@ class CI(IMF):
             self.X_hat[t] = (F @ self.X_hat[t - 1,].unsqueeze(-1)).squeeze()
             self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2) + Q
             # do the recursive update
+            # for z in range(self.z_dim, ):
+            # update in reverse order
             for z in range(self.z_dim):
+                z = self.z_dim - z - 1
+
                 mask = x_t[:, z].abs().sum(axis=-1) > 0.1
 
                 # if z > 0:
@@ -533,7 +537,9 @@ class ImprovedFastCI(IMF):
     def apply_filter(self) -> None:
         for t in tqdm(range(1, self.t_dim)):
             x_t = self.X[t]
-            p_t = self.P[t]
+            p_t = self.P[
+                t
+            ]  # + torch.eye(self.x_dim, dtype=torch.float32).to(self.device)
 
             F = CALCFilter.F_static(
                 dt_vect=self.Dt[t, :, 0],
@@ -543,6 +549,7 @@ class ImprovedFastCI(IMF):
             Q = CALCFilter.Q_static(
                 dt_vect=self.Dt[t, :, 0],
                 shape=(self.v_dim, self.x_dim, self.x_dim),
+                speed_info=x_t[:, 0, 1],
             ).to(self.device)
 
             self.X_hat[t] = (F @ self.X_hat[t - 1,].unsqueeze(-1)).squeeze()
@@ -766,6 +773,8 @@ def _inner_rts(
     Dts[t_inds, v_inds] = torch.from_numpy(
         chunk_df["time_diff"].to_numpy().copy().astype(np.float32)
     ).to(device)
+
+    # CALCFilter.w_d = 4
 
     X_smooth, _ = CALCFilter.rts_smoother(
         X,
