@@ -34,21 +34,23 @@ def build_h_matrix() -> FloatTensor:
     )
 
 
-def build_r_matrix(pos_error: float = 0.5) -> FloatTensor:
+def build_r_matrix(pos_error: float = 0.5, d_pos_error: float = 0.5) -> FloatTensor:
     """
     Build the R matrix for the Kalman filter
 
     This comes from https://www.smartmicro.com/fileadmin/media/Downloads/Traffic_Radar/Sensor_Data_Sheets__24_GHz_/UMRR-12_Type_48_TRUGRD_TM_Data_Sheet.pdf
 
     """
-    discretization_error = 0.1 # constant uncertainty based on the discretization of the frenet frame
+    discretization_error = (
+        0.1  # constant uncertainty based on the discretization of the frenet frame
+    )
 
     return torch.Tensor(
         np.array(
             [
                 [pos_error + discretization_error, 0, 0, 0],
                 [0, 0.5 + discretization_error, 0, 0],
-                [0, 0, 0.5 + discretization_error, 0],
+                [0, 0, d_pos_error + discretization_error, 0],
                 [0, 0, 0, 0.5 + discretization_error],
             ]
         )
@@ -104,7 +106,7 @@ class _VectorizedKalmanFilter:
 
     P_mod = 1
 
-    w_s = np.sqrt(8)
+    w_s = 8
     w_d = 1
 
     stop_speed_threshold = 0.5
@@ -485,11 +487,14 @@ class _VectorizedKalmanFilter:
 
             Pp = F_last @ Ps[k, mask] @ F_last.transpose(-1, -2) + Q_last
 
-
             # replace pinv with torch.linalg.lstsq(A, B).solution
             # K = torch.linalg.lstsq(Ps[k, mask] @ F_last.transpose(-1, -2), torch.eye(dim_x, device=device)).solution
-            
-            K = Ps[k, mask] @ F_last.transpose(-1, -2) @ torch.linalg.pinv(Pp, hermitian=True)
+
+            K = (
+                Ps[k, mask]
+                @ F_last.transpose(-1, -2)
+                @ torch.linalg.pinv(Pp, hermitian=True)
+            )
 
             out_Xs[k, mask] += K @ (out_Xs[k + 1, mask] - F_last @ out_Xs[k, mask])
             Ps[k, mask] += K @ (Ps[k + 1, mask] - Pp) @ K.transpose(-1, -2)
@@ -498,8 +503,8 @@ class _VectorizedKalmanFilter:
 
 
 class CALKFilter(_VectorizedKalmanFilter):
-    w_s = 10
-    w_d = 1
+    # w_s = 10
+    w_d = 5
 
     def __init__(
         self,
@@ -610,7 +615,7 @@ class CALKFilter(_VectorizedKalmanFilter):
 
 
 class CVLKFilter(_VectorizedKalmanFilter):
-    w_s = 10
+    # w_s = 10
     w_d = 1
 
     def __init__(
@@ -635,7 +640,7 @@ class CVLKFilter(_VectorizedKalmanFilter):
         dt_vect: int, shape: Tuple[int, ...]
     ) -> TensorType["vehicle", "x_dim", "x_dim"]:
         F = torch.zeros(shape)
-        
+
         F[:, 0, 0] = 1
         F[:, 0, 1] = dt_vect
         F[:, 1, 1] = 1
@@ -677,7 +682,7 @@ class CVLKFilter(_VectorizedKalmanFilter):
 
 
 class CALCFilter(_VectorizedKalmanFilter):
-    w_s = 10
+    # w_s = 10
     w_d = 1
 
     def __init__(
@@ -1082,7 +1087,7 @@ class IMMFilter:
         # cleanup all of the filters
         for f in self._filters:
             f.cleanup()
-        
+
         self._filters = []
         gc.collect()
         # clear the cache
@@ -1168,6 +1173,92 @@ def batch_imm_df(
 
         imm.cleanup()
         del imm
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    return pl.concat(filts)
+
+
+
+def batch_kalman_df(
+    df: pl.DataFrame,
+    filter: str,
+    gpu: bool = True,
+    chunk_size: int = 10_000,
+) -> pl.DataFrame:
+    import pyarrow as pa
+
+    filts = []
+
+    # chunk the filters
+    for chunk_df in tqdm(
+        df.with_columns(
+            (pl.col("vehicle_ind") // chunk_size).alias("chunk")
+        ).partition_by("chunk")
+    ):
+        offset = chunk_df["vehicle_ind"].min()
+
+        filter: _VectorizedKalmanFilter = eval(f"{filter}")
+
+        kf = filter(
+            chunk_df.with_columns(
+                (pl.col("vehicle_ind") - offset).alias("vehicle_ind")
+            ),
+            gpu=gpu,
+        )
+        
+
+        x_filt, p_filt = kf.apply_filter()
+        # mu_filt = imm._mu.cpu().numpy()
+
+        t_index = np.repeat(np.arange(kf.t_dim), kf.v_dim)
+        # v_index = np.tile(np.arange(imm.v_dim) + , imm.t_dim)
+        v_index = np.tile(np.arange(kf.v_dim), kf.t_dim) + offset
+        x_filt = x_filt.reshape(-1, kf.x_dim)
+        p_filt = p_filt.reshape(-1, kf.x_dim, kf.x_dim)
+        # p_calc = (
+        #     tuple(filter(lambda f: isinstance(f, CALCFilter), kf._filters))[0]
+        #     .P
+        #     # .detach()
+        #     .cpu()
+        #     .numpy()
+        #     .reshape(-1, imm.x_dim, imm.x_dim)
+        # )
+        # mu_filt = mu_filt.reshape(-1, imm.f_dim)
+        filts.append(
+            pl.DataFrame(
+                {
+                    "time_ind": t_index,
+                    "vehicle_ind": v_index,
+                    "s": x_filt[:, 0],
+                    "s_velocity": x_filt[:, 1],
+                    "s_accel": x_filt[:, 2],
+                    "d": x_filt[:, 3],
+                    "d_velocity": x_filt[:, 4],
+                    "d_accel": x_filt[:, 5],
+                    "P": pa.FixedSizeListArray.from_arrays(
+                        p_filt.reshape(-1), kf.x_dim * kf.x_dim
+                    ),
+                    # "P_CALC": pa.FixedSizeListArray.from_arrays(
+                    #     p_calc.reshape(-1), imm.x_dim * imm.x_dim
+                    # ),
+                    # **{
+                    #     f"mu_{f}": mu_filt[:, i]
+                    #     for i, f in enumerate(filt.upper() for filt in filters)
+                    # },
+                }
+            ).with_columns(
+                [
+                    pl.col("time_ind").cast(pl.Int32),
+                    pl.col("vehicle_ind").cast(pl.Int32),
+                ]
+            )
+        )
+
+        kf.cleanup()
+        del kf
         gc.collect()
         torch.cuda.empty_cache()
 

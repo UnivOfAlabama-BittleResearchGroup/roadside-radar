@@ -118,6 +118,8 @@ def build_leader_follower_df(df: pl.DataFrame, s_col: str = "s") -> pl.DataFrame
         "P",
         "prediction",
         "ip",
+        "length_s",
+        "lane_index",
     ]
 
     # create a lane_hash column
@@ -137,7 +139,9 @@ def build_leader_follower_df(df: pl.DataFrame, s_col: str = "s") -> pl.DataFrame
     return (
         df.select(["object_id", "epoch_time", "lane_hash", "leader", *keep_cols])
         .join(
-            df.select(["object_id", "epoch_time", "lane_hash", *keep_cols]),
+            df.select(["object_id", "epoch_time", "lane_hash", *keep_cols]).drop(
+                "lane_index"
+            ),
             left_on=[
                 "leader",
                 "epoch_time",
@@ -260,6 +264,7 @@ def pipe_gate_headway_calc(
             pl.col("epoch_time").first().alias("epoch_time"),
             pl.col("prediction").any().alias("prediction"),
             pl.col("prediction_leader").any().alias("prediction_leader"),
+            pl.col('headway').min().alias('headway'),
         )
     )
 
@@ -422,24 +427,24 @@ def build_fusion_df(
             count=pl.col("epoch_time").count().over(["epoch_time", "vehicle_id"]),
             timedelta=(pl.col("epoch_time").max() - pl.col("epoch_time"))
             .dt.total_milliseconds()
-            .over("vehicle_id")
+            .over("vehicle_id"),
         )
-        # # filter out the first second of measurements if the count > 0
-        # .filter(~((pl.col("cumcount") >= 1) & (pl.col("cumtime") < 10)))
-        # .drop(["cumtime", "cumcount", "count"])
-        # .with_columns(
-        #     # cumtime=pl.col("epoch_time").cum_count().over("object_id"),
-        #     cumcount=pl.col("epoch_time")
-        #     .cum_count()
-        #     .over(["epoch_time", "vehicle_id"]),
-        #     count=pl.col("epoch_time").count().over(["epoch_time", "vehicle_id"]),
+        # filter out the first second of measurements if the count > 0
+        # .filter((pl.col('cumtime') > 10) | (pl.col('cumcount') < 1))
+        # # .drop(["cumtime", "cumcount", "count"])
+        .with_columns(
+            # cumtime=pl.col("epoch_time").cum_count().over("object_id"),
+            cumcount=pl.col("epoch_time")
+            .cum_count()
+            .over(["epoch_time", "vehicle_id"]),
+            count=pl.col("epoch_time").count().over(["epoch_time", "vehicle_id"]),
+        )
+        # .filter(
+        #     (
+        #         # remove kalman filter errors in the radar
+        #         ~((pl.col("cumcount") == 0) & pl.col("prediction") & (pl.col("count") > 1))
+        #     )
         # )
-        .filter(
-            (
-                # remove kalman filter errors in the radar
-                ~((pl.col("count") > 1) & pl.col("prediction"))
-            )
-        )
         # .filter(
         #     (
         #         ~((pl.col('count') > 1) & pl.col('prediction'))
@@ -448,7 +453,6 @@ def build_fusion_df(
         # .with_columns(
         #     # count again after filtering
         #     # cumcount=pl.col("epoch_time").count().over(["epoch_time", "vehicle_id"]),
-            
         # )
         # .filter(
         #     (~pl.col("prediction") | (pl.col("cumcount") > 1))
@@ -517,3 +521,68 @@ def build_fusion_df(
     )
 
     return ci_df
+
+
+@lazify
+@timeit
+def filter_bad_lane_matches(
+    df: pl.DataFrame, traj_df: pl.DataFrame, s_threshold: float = 20
+) -> pl.DataFrame:
+    return df.filter(
+        pl.col("pair").is_in(
+            df.lazy()
+            .drop("epoch_time")
+            .unnest("pair")
+            .join(
+                traj_df.select(
+                    [
+                        "object_id",
+                        "epoch_time",
+                        "lane",
+                        "lane_index",
+                        "s",
+                    ]
+                ).lazy(),
+                how="left",
+                left_on="leader",
+                right_on="object_id",
+            )
+            .join(
+                traj_df.select(
+                    [
+                        "object_id",
+                        "epoch_time",
+                        "lane",
+                        "lane_index",
+                        "s",
+                    ]
+                ).lazy(),
+                how="left",
+                left_on=["object_id", "epoch_time"],
+                right_on=["object_id", "epoch_time"],
+            )
+            .group_by(["object_id", "leader"])
+            .agg(
+                (
+                    # (pl.col("lane") == pl.col("lane_right"))
+                    (pl.col("lane_index") == pl.col("lane_index_right"))
+                    | pl.col("lane_index").is_null()
+                    | pl.col("lane_index_right").is_null()
+                )
+                .all()
+                .alias("lane_match"),
+                (
+                    ((pl.col("s") - pl.col("s_right")).abs() < s_threshold)
+                    | pl.col("s").is_null()
+                    | pl.col("s_right").is_null()
+                )
+                .all()
+                .alias("s_match"),
+            )
+            .filter(pl.col("lane_match") & pl.col("s_match"))
+            .with_columns(
+                pl.struct(["leader", "object_id"]).alias("pair"),
+            )
+            .collect(streaming=True)["pair"]
+        )
+    )

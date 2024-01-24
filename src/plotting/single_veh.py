@@ -13,6 +13,9 @@ def plot_vehicle(
     fig: go.Figure = None,
     data_name: str = None,
     show_d = True,
+    row_mod: int = 0,
+    marker_size: int = 5,
+    
 ) -> go.Figure:
     
     if show_d:
@@ -54,12 +57,12 @@ def plot_vehicle(
                 y=veh_df[col],
                 mode="markers",
                 name=data_name if data_name is not None else name,
-                marker=dict(color=color, size=5),
+                marker=dict(color=color, size=marker_size),
                 showlegend=(i == 0 and data_name is not None),
                 # line=dict(color=color, dash="solid" if secondary_y else "dot"),
             ),
             secondary_y=secondary_y,
-            row=i // 2 + 1,
+            row=i // 2 + 1 + row_mod,
             col=1,
         )
 
