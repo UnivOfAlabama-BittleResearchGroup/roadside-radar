@@ -1,3 +1,4 @@
+import gc
 from typing import List, Union
 from itertools import permutations
 import numpy as np
@@ -14,6 +15,7 @@ from src.filters.vectorized_kalman import (
     CVLKFilter,
     CALCFilter,
     pick_device,
+    gen_chunks,
 )
 
 
@@ -222,9 +224,20 @@ def association_loglikelihood_distance(
         torch.isnan(d)
     ] = 1  # replace nan with 0 (this happens when the determinant is near 0)
 
+    # zero out all local tensors
+    del Z_followers
+    del Z_leaders
+    del Z_error
+    del P
+    del S
+    torch.cuda.empty_cache()
+
+    d = d.detach().cpu().numpy()
+    gc.collect()
+
     return df.with_columns(
         [
-            pl.Series(d.detach().cpu().numpy()).alias("association_distance"),
+            pl.Series(d).alias("association_distance"),
         ]
     )
 
@@ -442,8 +455,11 @@ class IMF:
         t_index = np.repeat(np.arange(self.t_dim), self.v_dim)
         v_index = np.tile(np.arange(self.v_dim), self.t_dim)
 
-        X = self.X_hat.detach().cpu().numpy().reshape(-1, 6)
-        P = self.P_hat.detach().cpu().numpy().reshape(-1, 6, 6)
+        X = self.X_hat.cpu().numpy().reshape(-1, 6)
+        P = self.P_hat.cpu().numpy().reshape(-1, 6, 6)
+
+        del self.X_hat
+        del self.P_hat
 
         return pl.DataFrame(
             {
@@ -472,7 +488,7 @@ class IMF:
         # iterate through variables in the class and del if it is a tensor
         for attr in dir(self):
             if isinstance(getattr(self, attr), torch.Tensor):
-                delattr(self, attr)
+                setattr(self, attr, torch.zeros(1))
 
         # clear the cache
         torch.cuda.empty_cache()
@@ -641,12 +657,12 @@ class MeasurementCI(IMF):
             self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2) + Q
 
             omega = torch.tensor(0.5).to(self.device)
-            
+
             z_hat_t = self.X_hat[t] @ H.T
-            
+
             for z in range(self.z_dim):
                 mask = x_t[:, z].abs().sum(axis=-1) > 0.1
-    
+
                 y = z_t[mask, z] - z_hat_t[mask]
 
                 sigma_y = H @ ((1 / omega) * self.P_hat[t, mask]) @ H.T + (
@@ -733,7 +749,7 @@ class MeasurementCI(IMF):
 def batch_join(
     df: pl.DataFrame,
     method: Union[str, object],
-    batch_size: int = 8_000,
+    batch_size: int = 1_000_000,
     gpu: bool = True,
     s_col: str = "s",
 ) -> pl.DataFrame:
@@ -741,14 +757,14 @@ def batch_join(
         (pl.col("vehicle_time_index_int").max().over("vehicle_id") >= 1).alias("filter")
     )
 
-    filter_df = df.filter(pl.col("filter")).clone()
+    filter_df = df.filter(pl.col("filter")).lazy()
 
     filter_df = filter_df.join(
         filter_df.select(pl.col("vehicle_id").unique()).with_row_count(
             "vehicle_id_int"
         ),
         on=["vehicle_id"],
-    )
+    ).collect(streaming=True)
 
     try:
         filter_cls: Union[IMF, CI] = (
@@ -760,10 +776,20 @@ def batch_join(
         # create a list of the chunks
         for chunk_df in (
             filter_df
-            # .filter(pl.col("filter"))
+            # # .filter(pl.col("filter"))
             .with_columns(
                 (pl.col("vehicle_id_int") // batch_size).alias("chunk")
             ).partition_by("chunk")
+            # tqdm(
+            #     # list(
+            #     gen_chunks(
+            #         filter_df,
+            #         chunk_size=batch_size,
+            #         vehicle_index="vehicle_id_int",
+            #         time_index="time_index",
+            #     )
+            #     # )
+            # )
         ):
             offset = chunk_df["vehicle_id_int"].min()
 
@@ -806,6 +832,9 @@ def batch_join(
             )
 
             imf.cleanup()
+            del imf
+            torch.cuda.empty_cache()
+            gc.collect()
 
         non_filter_df = (
             df.filter(~pl.col("filter"))
@@ -836,7 +865,10 @@ def batch_join(
         return pl.concat([*dfs, non_filter_df]).drop(["chunk", "time_diff"])
     except Exception as e:
         if "imf" in locals():
-            imf.cleanup()
+            imf.cleanup()   # noqa: F821
+        del imf
+        torch.cuda.empty_cache()
+        gc.collect()
 
         raise e
 
@@ -869,6 +901,24 @@ def rts_smooth(
     for chunk_df in df.with_columns(
         (pl.col("vehicle_id_int") // batch_size).alias("chunk")
     ).partition_by("chunk"):
+            # create a list of the chunks
+    # for chunk_df in (
+    #         df
+    #         # .filter(pl.col("filter"))
+    #         .with_columns(
+    #             (pl.col("vehicle_id_int") // batch_size).alias("chunk")
+    #         ).partition_by("chunk")
+    #         # tqdm(
+    #         #     list(
+    #         #         gen_chunks(
+    #         #             df,
+    #         #             chunk_size=batch_size,
+    #         #             vehicle_index="vehicle_id_int",
+    #         #             time_index="time_index",
+    #         #         )
+    #         #     )
+    #         # )
+    #     ):
         _inner_rts(dfs, chunk_df, device, s_col)
 
         torch.cuda.empty_cache()
@@ -922,11 +972,9 @@ def _inner_rts(
         dtype=torch.float32,
     ).to(device)
 
-    P[t_inds, v_inds] = (
-        torch.from_numpy(
-            chunk_df["ci_P"].to_numpy().copy().reshape(-1, 6, 6).astype(np.float32)
-        ).to(device) 
-    ) 
+    P[t_inds, v_inds] = torch.from_numpy(
+        chunk_df["ci_P"].to_numpy().copy().reshape(-1, 6, 6).astype(np.float32)
+    ).to(device)
 
     # P[..., 1, 1] += 2
 
@@ -935,7 +983,7 @@ def _inner_rts(
     Dts[t_inds, v_inds] = torch.from_numpy(
         chunk_df["time_diff"].to_numpy().copy().astype(np.float32)
     ).to(device)
-    
+
     # CALCFilter.w_s = 1
 
     X_smooth, _ = CALCFilter.rts_smoother(

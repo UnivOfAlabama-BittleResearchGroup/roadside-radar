@@ -127,8 +127,8 @@ def build_leader_follower_df(df: pl.DataFrame, s_col: str = "s") -> pl.DataFrame
 
     # sort by epoch_time and s
     df = df.sort(
-        ["epoch_time", s_col],
-    ).set_sorted(["epoch_time", s_col])
+        ["epoch_time", "lane_hash", s_col],
+    ).set_sorted(["epoch_time", "lane_hash", s_col])
 
     # shift over time to get the leader
     df = df.with_columns(
@@ -154,6 +154,7 @@ def build_leader_follower_df(df: pl.DataFrame, s_col: str = "s") -> pl.DataFrame
             suffix="_leader",
         )
         .sort("epoch_time")
+        .set_sorted("epoch_time")
         .with_columns(
             (pl.col(f"{s_col}_leader") - pl.col(s_col)).alias("s_gap"),
         )
@@ -264,7 +265,7 @@ def pipe_gate_headway_calc(
             pl.col("epoch_time").first().alias("epoch_time"),
             pl.col("prediction").any().alias("prediction"),
             pl.col("prediction_leader").any().alias("prediction_leader"),
-            pl.col('headway').min().alias('headway'),
+            pl.col("headway").min().alias("headway"),
         )
     )
 

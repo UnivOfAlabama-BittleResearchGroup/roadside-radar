@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import List, Tuple
+from typing import Generator, List, Tuple
 import torch
 from torch import FloatTensor
 import numpy as np
@@ -1094,24 +1094,65 @@ class IMMFilter:
         torch.cuda.empty_cache()
 
 
+def gen_chunks(
+    df: pl.DataFrame,
+    chunk_size: int = 10_000_000,
+    vehicle_index: str = "vehicle_ind",
+    time_index: str = "time_ind",
+) -> Generator[pl.DataFrame, None, None]:
+    end_index = -1
+    i = 0
+
+    chunker = (
+        df.lazy()
+        .group_by(
+            vehicle_index,
+        )
+        .agg(pl.col(time_index).max())
+        # .with_row_index()
+        .with_row_count("index")
+        .sort(vehicle_index)  # this is critical for the filter to work
+        .collect()
+    )
+
+    # filter_df = df.drop("index").with_row_index()
+    while end_index < (chunker.shape[0] - 1):
+        chunk = chunker.filter((pl.col("index") > end_index)).filter(
+            (pl.col(time_index).cum_max() * (pl.col(vehicle_index).cum_count()))
+            < chunk_size
+        )
+
+        end_index = chunk["index"][-1]
+
+        i += 1
+
+        yield df.filter(pl.col(vehicle_index).is_in(chunk[vehicle_index]))
+
+
 def batch_imm_df(
     df: pl.DataFrame,
     filters: List[str],
     M: np.ndarray,
     mu: np.ndarray,
     gpu: bool = True,
-    chunk_size: int = 10_000,
+    chunk_size: int = 10_000_000,
 ) -> pl.DataFrame:
     import pyarrow as pa
 
     filts = []
 
+    # df = df.sort(["time_ind", "vehicle_ind"])
+    # df.with_columns(
+    #     pl.col('time_ind').cumulative_eval()
+    # )
+
     # chunk the filters
-    for chunk_df in tqdm(
-        df.with_columns(
-            (pl.col("vehicle_ind") // chunk_size).alias("chunk")
-        ).partition_by("chunk")
-    ):
+    for chunk_df in tqdm(list(gen_chunks(df, chunk_size))):
+        # for chunk_df in tqdm(
+        #     df.with_columns(
+        #         (pl.col("vehicle_ind") // chunk_size).alias("chunk")
+        #     ).partition_by("chunk")
+        # ):
         offset = chunk_df["vehicle_ind"].min()
 
         imm = IMMFilter(
@@ -1181,7 +1222,6 @@ def batch_imm_df(
     return pl.concat(filts)
 
 
-
 def batch_kalman_df(
     df: pl.DataFrame,
     filter: str,
@@ -1208,7 +1248,6 @@ def batch_kalman_df(
             ),
             gpu=gpu,
         )
-        
 
         x_filt, p_filt = kf.apply_filter()
         # mu_filt = imm._mu.cpu().numpy()

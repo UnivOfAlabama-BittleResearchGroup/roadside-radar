@@ -60,7 +60,7 @@ def process_df(
 def prep_df(
     df: Union[pl.DataFrame, pl.LazyFrame],
     f: CalibratedRadar,
-) -> pl.DataFrame:
+) -> pl.LazyFrame:
     if not isinstance(df, pl.LazyFrame):
         df = df.lazy()
 
@@ -84,11 +84,21 @@ def prep_df(
         .pipe(f.add_heading)
         .pipe(f.rotate_radars)
         .pipe(f.update_origin)
+        .with_columns(
+            (pl.col("f32_positionX_m") ** 2 + pl.col("f32_positionY_m") ** 2)
+            .sqrt()
+            .alias("dist"),
+        )
+        .with_columns(
+            (pl.col("dist").diff().backward_fill(1).over("object_id") < 0).alias(
+                "approaching"
+            )
+        )
         # add in the lat/lon for plotting
         # .pipe(f.radar_to_latlon)
         .pipe(lambda df: df.with_row_count() if "row_nr" not in df.columns else df)
-        .sort(by=["object_id", "epoch_time"])
-        .set_sorted(["object_id", "epoch_time"])
-        .collect()
+        .sort(by=["epoch_time"])
+        .set_sorted(["epoch_time"])
+        # .collect()
         # .rechunk()
     )
