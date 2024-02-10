@@ -412,12 +412,12 @@ class IMF:
 
             p_hat_t_t1 = (
                 F[..., 0, :, :] @ self.P_hat[t - 1,] @ F[..., 0, :, :].transpose(-1, -2)
-                + Q[..., 0, :, :]
+                # + Q[..., 0, :, :]
             )
 
             # predict the individual measurements
             x_t_t1 = (F @ self.X[t - 1].unsqueeze(-1)).squeeze()
-            p_t_t1 = F @ self.P[t - 1] @ F.transpose(-1, -2) + Q
+            p_t_t1 = F @ self.P[t - 1] @ F.transpose(-1, -2) #+ Q
 
             # precompute the inverse
             p_hat_t_t1_i = torch.linalg.pinv(p_hat_t_t1, hermitian=True)
@@ -531,7 +531,7 @@ class CI(IMF):
             ).to(self.device)
 
             self.X_hat[t] = (F @ self.X_hat[t - 1,].unsqueeze(-1)).squeeze()
-            self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2) + Q
+            self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2) #+ Q
             # do the recursive update
             # for z in range(self.z_dim, ):
             # update in reverse order
@@ -583,16 +583,25 @@ class ImprovedFastCI(IMF):
     #  from https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=1591849
 
     def apply_filter(self) -> None:
-        R = build_r_matrix(pos_error=3).to(self.device)
-        H = build_h_matrix().to(self.device)
+        CALCFilter.w_s = 2
+        CALCFilter.w_d = 1
 
-        # # scale R to a x,dim x dim matrix
-        P_mod = H.T @ R @ H
+        # R = build_r_matrix(pos_error=0.5, d_pos_error=0.5).to(self.device)
+        # H = build_h_matrix().to(self.device)
 
-        # CALCFilter.w_s = 2
+        # # # scale R to a x,dim x dim matrix
+        # P_mod = (
+        #     H.T @ R @ H
+        # )  # / 10 #+ CALCFilter.P_mod * torch.eye(self.x_dim).to(self.device)
 
+        # self.P[:, ...]  = P_mod.clone() #+ CALCFilter.P_mod * torch.eye(self.x_dim).to(self.device)
+        # self.P_hat[0, ...] = P_mod
+        # # self.P = torch.clamp(self.P, min=0, max=15)
+        # self.P_hat = torch.clamp(self.P_hat, min=0, max=1)
         for t in tqdm(range(1, self.t_dim)):
             x_t = self.X[t]
+            # clamp the P matrix to be positive definite
+            self.P[t, ...] = torch.clamp(self.P[t, ...], min=1e-9, )
             p_t = self.P[t]  # + P_mod
 
             F = CALCFilter.F_static(
@@ -600,27 +609,30 @@ class ImprovedFastCI(IMF):
                 shape=(self.v_dim, self.x_dim, self.x_dim),
             ).to(self.device)
 
-            Q = CALCFilter.Q_static(
-                dt_vect=self.Dt[t, :, 0],
-                shape=(self.v_dim, self.x_dim, self.x_dim),
-                speed_info=x_t[:, 0, 1],
-            ).to(self.device)
-
             self.X_hat[t] = (F @ self.X_hat[t - 1,].unsqueeze(-1)).squeeze()
-            self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2) + Q
+            self.P_hat[t] = (
+                    F @ self.P_hat[t - 1,] @ F.transpose(
+                    -1, -2
+                ) 
+                # + CALCFilter.Q_static(
+                #     dt_vect=self.Dt[t, :, 0],
+                #     shape=(self.v_dim, self.x_dim, self.x_dim),
+                #     speed_info=x_t[:, 0, 1],
+                # ).to(self.device)
+            )
 
             for z in range(self.z_dim):
                 mask = x_t[:, z].abs().sum(axis=-1) > 0.1
 
-                I_i = torch.linalg.pinv(p_t[mask, z], hermitian=True)
-                I_hat = torch.linalg.pinv(self.P_hat[t, mask], hermitian=True)
+                I_i = torch.linalg.pinv(p_t[mask, z], )
+                I_hat = torch.linalg.pinv(self.P_hat[t, mask], )
                 d_i = determinant(I_hat + I_i)
                 omega = (d_i - determinant(I_i) + determinant(I_hat)) / (2 * d_i)
 
                 a1 = omega[..., None, None] * I_hat
                 a2 = (1 - omega[..., None, None]) * I_i
 
-                self.P_hat[t, mask] = torch.linalg.pinv(a1 + a2, hermitian=True)
+                self.P_hat[t, mask] = torch.linalg.pinv(a1 + a2,)
                 self.X_hat[t, mask] = (
                     self.P_hat[t, mask]
                     @ (
@@ -865,7 +877,7 @@ def batch_join(
         return pl.concat([*dfs, non_filter_df]).drop(["chunk", "time_diff"])
     except Exception as e:
         if "imf" in locals():
-            imf.cleanup()   # noqa: F821
+            imf.cleanup()  # noqa: F821
         del imf
         torch.cuda.empty_cache()
         gc.collect()
@@ -901,24 +913,24 @@ def rts_smooth(
     for chunk_df in df.with_columns(
         (pl.col("vehicle_id_int") // batch_size).alias("chunk")
     ).partition_by("chunk"):
-            # create a list of the chunks
-    # for chunk_df in (
-    #         df
-    #         # .filter(pl.col("filter"))
-    #         .with_columns(
-    #             (pl.col("vehicle_id_int") // batch_size).alias("chunk")
-    #         ).partition_by("chunk")
-    #         # tqdm(
-    #         #     list(
-    #         #         gen_chunks(
-    #         #             df,
-    #         #             chunk_size=batch_size,
-    #         #             vehicle_index="vehicle_id_int",
-    #         #             time_index="time_index",
-    #         #         )
-    #         #     )
-    #         # )
-    #     ):
+        # create a list of the chunks
+        # for chunk_df in (
+        #         df
+        #         # .filter(pl.col("filter"))
+        #         .with_columns(
+        #             (pl.col("vehicle_id_int") // batch_size).alias("chunk")
+        #         ).partition_by("chunk")
+        #         # tqdm(
+        #         #     list(
+        #         #         gen_chunks(
+        #         #             df,
+        #         #             chunk_size=batch_size,
+        #         #             vehicle_index="vehicle_id_int",
+        #         #             time_index="time_index",
+        #         #         )
+        #         #     )
+        #         # )
+        #     ):
         _inner_rts(dfs, chunk_df, device, s_col)
 
         torch.cuda.empty_cache()
@@ -934,6 +946,9 @@ def _inner_rts(
             "vehicle_id_int"
         )
     )
+
+    # CALCFilter.w_s = 4
+    # CALCFilter.w_d = 2
 
     t_dim = chunk_df["time_index"].max() + 1
     v_dim = chunk_df["vehicle_id_int"].max() + 1

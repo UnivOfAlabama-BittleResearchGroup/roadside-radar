@@ -265,7 +265,7 @@ def pipe_gate_headway_calc(
             pl.col("epoch_time").first().alias("epoch_time"),
             pl.col("prediction").any().alias("prediction"),
             pl.col("prediction_leader").any().alias("prediction_leader"),
-            pl.col("headway").min().alias("headway"),
+            pl.col("headway").ewm_mean(alpha=alpha).min().alias("headway"),
         )
     )
 
@@ -307,12 +307,16 @@ def build_match_df(
                 "epoch_time_max",
                 "epoch_time_max_leader",
                 "association_distance_filt",
+                "headway",
             ]
         )
         .filter(
-            pl.when(~(pl.col("prediction") | pl.col("prediction_leader")))
-            .then(pl.col("association_distance_filt") <= assoc_cutoff)
-            .otherwise(pl.col("association_distance_filt") <= assoc_cutoff_pred)
+            (
+                pl.when(~(pl.col("prediction") | pl.col("prediction_leader")))
+                .then(pl.col("association_distance_filt") <= assoc_cutoff)
+                .otherwise(pl.col("association_distance_filt") <= assoc_cutoff_pred)
+                # | (pl.col("headway") < 0.75)
+            )
         )
         .sort("value", "epoch_time")
         .with_columns(
@@ -424,33 +428,27 @@ def build_fusion_df(
             cumcount=pl.col("epoch_time")
             .cum_count()
             .over(["epoch_time", "vehicle_id"]),
-            # count the total number of measurements per vehicle
-            count=pl.col("epoch_time").count().over(["epoch_time", "vehicle_id"]),
+            # # count the total number of measurements per vehicle
+            # count=pl.col("epoch_time").count().over(["epoch_time", "vehicle_id"]),
             timedelta=(pl.col("epoch_time").max() - pl.col("epoch_time"))
             .dt.total_milliseconds()
             .over("vehicle_id"),
         )
         # filter out the first second of measurements if the count > 0
-        # .filter((pl.col('cumtime') > 10) | (pl.col('cumcount') < 1))
+        .filter((pl.col("cumcount") < 1) | (pl.col("cumtime") > 15))
+        .collect()
+        .lazy()
         # # .drop(["cumtime", "cumcount", "count"])
         .with_columns(
-            # cumtime=pl.col("epoch_time").cum_count().over("object_id"),
-            cumcount=pl.col("epoch_time")
-            .cum_count()
-            .over(["epoch_time", "vehicle_id"]),
+            #  recount
             count=pl.col("epoch_time").count().over(["epoch_time", "vehicle_id"]),
+            all_pred=pl.col("prediction").all().over(["epoch_time", "vehicle_id"]),
         )
-        # .filter(
-        #     (
-        #         # remove kalman filter errors in the radar
-        #         ~((pl.col("cumcount") == 0) & pl.col("prediction") & (pl.col("count") > 1))
-        #     )
-        # )
-        # .filter(
-        #     (
-        #         ~((pl.col('count') > 1) & pl.col('prediction'))
-        #     )
-        # )
+        .filter(
+            ~pl.col("prediction")
+            | (pl.col("count") == 1)
+            | (pl.col("all_pred") & (pl.col("count") > 1))
+        )
         # .with_columns(
         #     # count again after filtering
         #     # cumcount=pl.col("epoch_time").count().over(["epoch_time", "vehicle_id"]),

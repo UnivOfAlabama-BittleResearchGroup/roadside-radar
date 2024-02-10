@@ -106,7 +106,7 @@ class _VectorizedKalmanFilter:
 
     P_mod = 1
 
-    w_s = 8
+    w_s = np.sqrt(8)
     w_d = 1
 
     stop_speed_threshold = 0.5
@@ -979,6 +979,7 @@ class IMMFilter:
         self._mu[t_ind, ~mask] = self._mu[max(t_ind - 1, 0), ~mask]
 
         self._mu[t_ind, self._predict_mask[t_ind], 0] = 0
+        self._mu[t_ind, self._predict_mask[t_ind], 1] = 0
         self._mu[t_ind,] = self._mu[t_ind,] / self._mu[t_ind,].sum(dim=1, keepdim=True)
 
         # compute the mixing probabilities
