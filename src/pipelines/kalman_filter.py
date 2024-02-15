@@ -311,16 +311,17 @@ def build_kalman_df(
                 pl.concat_list(
                     [
                         pl.col(s_col),
-                        pl.col("s_velocity"),
+                        # pl.col("s_velocity"),
                         pl.col("d"),
-                        pl.col("d_velocity"),
+                        # pl.col("d_velocity"),
                     ]
                 )
-                .cast(pl.Array(width=4, inner=pl.Float32))
+                .cast(pl.Array(width=2, inner=pl.Float32))
                 .alias("measurement"),
                 pl.col("prediction"),
                 pl.col("missing_data"),
                 pl.col("epoch_time").cum_count().over("kalman_id").alias("time_ind"),
+                pl.col('s_velocity')
             ]
         )
         .with_columns(

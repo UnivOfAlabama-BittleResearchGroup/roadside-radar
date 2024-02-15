@@ -26,15 +26,15 @@ def build_h_matrix() -> FloatTensor:
         np.array(
             [
                 [1, 0, 0, 0, 0, 0],
-                [0, 1, 0, 0, 0, 0],
+                # [0, 0, 0, 0, 0, 0],
                 [0, 0, 0, 1, 0, 0],
-                [0, 0, 0, 0, 1, 0],
+                # [0, 0, 0, 0, 0, 0],
             ]
         ),
     )
 
 
-def build_r_matrix(pos_error: float = 0.5, d_pos_error: float = 0.5) -> FloatTensor:
+def build_r_matrix(pos_error: float = 0.3, d_pos_error: float = 0.3) -> FloatTensor:
     """
     Build the R matrix for the Kalman filter
 
@@ -45,13 +45,27 @@ def build_r_matrix(pos_error: float = 0.5, d_pos_error: float = 0.5) -> FloatTen
         0.1  # constant uncertainty based on the discretization of the frenet frame
     )
 
+    # return torch.Tensor(
+    #     np.array(
+    #         [
+    #             [pos_error + discretization_error, 0, 0, 0],
+    #             [0, 0.5 + discretization_error, 0, 0],
+    #             [0, 0, d_pos_error + discretization_error, 0],
+    #             [0, 0, 0, 0.5 + discretization_error],
+    #         ]
+    #     )
+    #     ** 2,
+    # )
     return torch.Tensor(
         np.array(
             [
-                [pos_error + discretization_error, 0, 0, 0],
-                [0, 0.5 + discretization_error, 0, 0],
-                [0, 0, d_pos_error + discretization_error, 0],
-                [0, 0, 0, 0.5 + discretization_error],
+                [
+                    pos_error + discretization_error,
+                    0,
+                ],
+                # [0, 0.5 + discretization_error, 0, 0],
+                [0, d_pos_error + discretization_error],
+                # [0, 0, 0, 0.5 + discretization_error],
             ]
         )
         ** 2,
@@ -102,12 +116,12 @@ def pick_device(gpu: bool = True) -> torch.device:
 
 class _VectorizedKalmanFilter:
     x_dim = 6
-    z_dim = 4
+    z_dim = 2
 
     P_mod = 1
 
-    w_s = np.sqrt(8)
-    w_d = 1
+    w_s = np.sqrt(4)
+    w_d = np.sqrt(2)
 
     stop_speed_threshold = 0.5
 
@@ -119,6 +133,7 @@ class _VectorizedKalmanFilter:
         predict_mask: TensorType["time", "vehicle"] = None,
         inds: TensorType = None,
         gpu: bool = True,
+        init_vel: TensorType["vehicle"] = None,
     ) -> None:
         if z is None:
             self._device = pick_device(gpu=gpu)
@@ -200,6 +215,18 @@ class _VectorizedKalmanFilter:
             (self.t_dim, self.v_dim, self.x_dim), device=self._device
         )
         self._x[0, :, :] = self._z[0] @ self._H
+        if init_vel is None:
+            self._x[0, :, 1] = (
+                torch.from_numpy(
+                    df.filter(pl.col("time_ind") == 0)["s_velocity"].to_numpy().copy()
+                )
+                .to(self._device)
+                .clone()
+            )
+        else:
+            self._x[0, :, 1] = init_vel.clone()
+        # initialize the velocity
+        # self._x[0, :, 2] = df.filter(pl.col('time_ind'))
 
         # create P matrix
         self._P: TensorType["time", "vehicle", "x_dim", "x_dim"] = torch.zeros(
@@ -231,6 +258,7 @@ class _VectorizedKalmanFilter:
             dt=other_filter.dt,
             predict_mask=other_filter.predict_mask,
             inds=other_filter.inds,
+            init_vel=other_filter._x[0, :, 1],
         )
 
     @classmethod

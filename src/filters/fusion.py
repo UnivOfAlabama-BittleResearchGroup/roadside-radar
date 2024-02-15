@@ -9,7 +9,7 @@ import pyarrow as pa
 from scipy.stats import chi2
 
 from src.filters.vectorized_kalman import (
-    build_h_matrix,
+    # build_h_matrix,
     build_r_matrix,
     CALKFilter,
     CVLKFilter,
@@ -59,6 +59,24 @@ from src.filters.vectorized_kalman import (
 #         )
 
 
+def build_h_matrix() -> torch.FloatTensor:
+    """
+    Build the H matrix for the Kalman filter.
+
+    IDK why this is a function, but it is. ChatGPT made me do it
+    """
+    return torch.FloatTensor(
+        np.array(
+            [
+                [1, 0, 0, 0, 0, 0],
+                [0, 1, 0, 0, 0, 0],
+                [0, 0, 0, 1, 0, 0],
+                [0, 0, 0, 0, 1, 0],
+            ]
+        ),
+    )
+
+
 def create_z_matrices(df, Z_followers, Z_leaders, pos_override=None):
     if pos_override is None:
         pos_override = ["s", "front_s", "back_s"]
@@ -92,7 +110,7 @@ def loglikelihood(
 
     H = build_h_matrix().to(torch.float32).to(device)
 
-    R = build_r_matrix().to(torch.float32).to(device)
+    # R = build_r_matrix().to(torch.float32).to(device)
 
     P_leader = torch.from_numpy(
         df["P_leader"]
@@ -104,7 +122,7 @@ def loglikelihood(
         )
     ).to(device)
 
-    S_leader = H @ P_leader @ H.T + R
+    S_leader = H @ P_leader @ H.T #+ R
 
     Z_followers = []
     Z_leaders = []
@@ -146,7 +164,7 @@ def association_loglikelihood_distance(
     device = pick_device(gpu)
 
     H = build_h_matrix().to(device)
-    R = build_r_matrix(d_pos_error=1.38, pos_error=2).to(device)
+    # R = build_r_matrix(d_pos_error=1.38, pos_error=2).to(device)
 
     P = torch.from_numpy(
         df["P_leader"]
@@ -182,8 +200,9 @@ def association_loglikelihood_distance(
     #         .ravel()
     #         # / 2
     #     ).to(device)
-
-    S = H @ P @ H.T + R
+    
+    # S = R
+    S = H @ P @ H.T #+ R
     S = S[:, :dims, :dims]
 
     Z_followers = []
@@ -223,6 +242,8 @@ def association_loglikelihood_distance(
     d[
         torch.isnan(d)
     ] = 1  # replace nan with 0 (this happens when the determinant is near 0)
+
+    # d[s_overlap] = 0
 
     # zero out all local tensors
     del Z_followers
@@ -359,7 +380,7 @@ class IMF:
         )
 
         P[t_index, v_index, z_index] = torch.from_numpy(
-            df["P_CALC"].to_numpy().copy().reshape(-1, 6, 6).astype(np.float32)
+            df["P"].to_numpy().copy().reshape(-1, 6, 6).astype(np.float32)
         )
 
         # adding additional process noise to the length of the vehicle
@@ -583,8 +604,8 @@ class ImprovedFastCI(IMF):
     #  from https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=1591849
 
     def apply_filter(self) -> None:
-        CALCFilter.w_s = 2
-        CALCFilter.w_d = 1
+        # CALCFilter.w_s = 2
+        # CALCFilter.w_d = 1
 
         # R = build_r_matrix(pos_error=0.5, d_pos_error=0.5).to(self.device)
         # H = build_h_matrix().to(self.device)
@@ -613,12 +634,11 @@ class ImprovedFastCI(IMF):
             self.P_hat[t] = (
                     F @ self.P_hat[t - 1,] @ F.transpose(
                     -1, -2
-                ) 
-                # + CALCFilter.Q_static(
-                #     dt_vect=self.Dt[t, :, 0],
-                #     shape=(self.v_dim, self.x_dim, self.x_dim),
-                #     speed_info=x_t[:, 0, 1],
-                # ).to(self.device)
+                ) + CALCFilter.Q_static(
+                    dt_vect=self.Dt[t, :, 0],
+                    shape=(self.v_dim, self.x_dim, self.x_dim),
+                    speed_info=x_t[:, 0, 1],
+                ).to(self.device)
             )
 
             for z in range(self.z_dim):
@@ -673,6 +693,7 @@ class MeasurementCI(IMF):
             z_hat_t = self.X_hat[t] @ H.T
 
             for z in range(self.z_dim):
+                
                 mask = x_t[:, z].abs().sum(axis=-1) > 0.1
 
                 y = z_t[mask, z] - z_hat_t[mask]
@@ -878,7 +899,7 @@ def batch_join(
     except Exception as e:
         if "imf" in locals():
             imf.cleanup()  # noqa: F821
-        del imf
+        del imf  # noqa: F821
         torch.cuda.empty_cache()
         gc.collect()
 

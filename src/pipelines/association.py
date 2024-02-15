@@ -11,6 +11,7 @@ def add_front_back_s(
     df: pl.DataFrame,
     use_median_length: bool = False,
     use_nearest_length: bool = False,
+    use_global_median: bool = False,
     s_col: str = "s",
 ) -> pl.DataFrame:
     required_columns = {s_col, "distanceToFront_s", "distanceToBack_s", "length_s"}
@@ -35,6 +36,44 @@ def add_front_back_s(
         #     )
         #     .drop(["median_length_s", "front_percent", "back_percent"])
         # )
+
+    if use_global_median:
+        median_length = df.select(
+            pl.col("length_s").filter(pl.col("dist").is_between(10, 30)).median()
+        ).collect()["length_s"][0]
+
+        return (
+            df
+            .with_columns(
+                pl.when((pl.col("dist") >= 30) & (pl.col("length_s") < median_length))
+                .then(pl.lit(median_length))
+                .otherwise(pl.col("length_s"))
+                .alias("corrected_length_s")
+            )
+            .with_columns(
+                pl.when(pl.col("approaching"))
+                .then(pl.col("distanceToFront_s") + pl.col("s"))
+                .otherwise(
+                    (
+                        pl.col("distanceToBack_s")
+                        + pl.col("s")
+                        + pl.col("corrected_length_s")
+                    )
+                )
+                .alias("front_s"),
+                pl.when(pl.col("approaching"))
+                .then(
+                    (
+                        pl.col("distanceToFront_s")
+                        + pl.col("s")
+                        - pl.col("corrected_length_s")
+                    )
+                )
+                .otherwise(pl.col("distanceToBack_s") + pl.col("s"))
+                .alias("back_s"),
+            )
+            .drop("corrected_length_s")
+        )
 
     if use_nearest_length:
         # if approaching, we can assume that the distanceToFront_s is right,
