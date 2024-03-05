@@ -19,65 +19,96 @@ from src.filters.vectorized_kalman import (
 )
 
 
-# def create_z_matrices(df, Z_followers, Z_leaders):
-#     positions = ["s", "front_s", "back_s"]
-#     # Create all combinations of leader and follower positions
-#     for follower_pos, leader_pos in permutations(positions, 2):
-#         follower_col = [
-#             f"{follower_pos}",
-#             "s_velocity",
-#             "d",
-#             "d_velocity",
-#         ]
-#         leader_col = [
-#             f"{leader_pos}_leader",
-#             "s_velocity_leader",
-#             "d_leader",
-#             "d_velocity_leader",
-#         ]
+def create_z_matrices_permute(df, Z_followers, Z_leaders, column_creator):
 
-#         # Append follower data to Z_followers
-#         Z_followers.append(
-#             torch.from_numpy(
-#                 df[follower_col]
-#                 .to_numpy()
-#                 .copy()
-#                 .reshape(-1, 4, 1)
-#                 .astype(dtype=np.float32),
-#             )
-#         )
+    positions = ["s", "front_s", "back_s"]
+    # Create all combinations of leader and follower positions
+    for follower_pos, leader_pos in permutations(positions, 2):
+        
+        # Append follower data to Z_followers
+        Z_followers.append(
+            torch.from_numpy(
+                df[column_creator(follower_pos, "")]
+                .to_numpy()
+                .copy()
+                .reshape(-1, 2, 1)
+                .astype(dtype=np.float32),
+            )
+        )
 
-#         # Append leader data to Z_leaders
-#         Z_leaders.append(
-#             torch.from_numpy(
-#                 df[leader_col]
-#                 .to_numpy()
-#                 .copy()
-#                 .reshape(-1, 4, 1)
-#                 .astype(dtype=np.float32),
-#             )
-#         )
+        # Append leader data to Z_leaders
+        Z_leaders.append(
+            torch.from_numpy(
+                df[column_creator(leader_pos, "_leader")]
+                .to_numpy()
+                .copy()
+                .reshape(-1, 2, 1)
+                .astype(dtype=np.float32),
+            )
+        )
 
 
-def build_h_matrix() -> torch.FloatTensor:
+def build_h_matrix(dims: int = 4) -> torch.FloatTensor:
     """
     Build the H matrix for the Kalman filter.
 
     IDK why this is a function, but it is. ChatGPT made me do it
     """
-    return torch.FloatTensor(
-        np.array(
-            [
-                [1, 0, 0, 0, 0, 0],
-                [0, 1, 0, 0, 0, 0],
-                [0, 0, 0, 1, 0, 0],
-                [0, 0, 0, 0, 1, 0],
+    if dims == 6:
+        return torch.FloatTensor(
+            np.eye(6),
+        )
+    
+    elif dims == 4:
+        return torch.FloatTensor(
+            np.array(
+                [
+                    [1, 0, 0, 0, 0, 0],
+                    [0, 1, 0, 0, 0, 0],
+                    [0, 0, 0, 1, 0, 0],
+                    [0, 0, 0, 0, 1, 0],
+                ]
+            ),
+        )
+    elif dims == 2:
+        return torch.FloatTensor(
+            np.array(
+                [
+                    [1, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 1, 0, 0],
+                ]
+            ),
+        )
+
+
+def create_z_matrices(df, Z_followers, Z_leaders, pos_override=None, dims: int = 4, permute: bool = False):
+    
+    def column_creator(pos, ext):
+        if dims == 6:
+            return [
+                f"{pos}{ext}",
+                f"s_velocity{ext}",
+                f"s_accel{ext}",
+                f"d{ext}",
+                f"d_velocity{ext}",
+                f"d_accel{ext}",
             ]
-        ),
-    )
-
-
-def create_z_matrices(df, Z_followers, Z_leaders, pos_override=None):
+        if dims == 4:
+            return [
+                f"{pos}{ext}",
+                f"s_velocity{ext}",
+                f"d{ext}",
+                f"d_velocity{ext}",
+            ]
+        elif dims == 2:
+            return [
+                f"{pos}{ext}",
+                f"d{ext}",
+            ]
+    
+    if permute:
+        return create_z_matrices_permute(df, Z_followers, Z_leaders, column_creator)
+    
     if pos_override is None:
         pos_override = ["s", "front_s", "back_s"]
     for pos in pos_override:
@@ -85,16 +116,11 @@ def create_z_matrices(df, Z_followers, Z_leaders, pos_override=None):
             l.append(
                 torch.from_numpy(
                     df[
-                        [
-                            f"{pos}{ext}",
-                            f"s_velocity{ext}",
-                            f"d{ext}",
-                            f"d_velocity{ext}",
-                        ]
+                        column_creator(pos, ext)
                     ]
                     .to_numpy()
                     .copy()
-                    .reshape(-1, 4, 1)
+                    .reshape(-1, dims, 1)
                     .astype(
                         dtype=np.float32,
                     ),
@@ -160,11 +186,13 @@ def association_loglikelihood_distance(
     dims: int = 4,
     # augment_length: bool = True,
     length_cols: List[str] = ["length_s", "length_s_leader"],
+    permute: bool = False,
 ) -> pl.DataFrame:
     device = pick_device(gpu)
 
-    H = build_h_matrix().to(device)
+    H = build_h_matrix(dims=dims).to(device)
     # R = build_r_matrix(d_pos_error=1.38, pos_error=2).to(device)
+    R = build_r_matrix().to(device)
 
     P = torch.from_numpy(
         df["P_leader"]
@@ -202,16 +230,18 @@ def association_loglikelihood_distance(
     #     ).to(device)
     
     # S = R
-    S = H @ P @ H.T #+ R
+    S = H @ P @ H.T 
+    if dims == 2:
+        S += R
     S = S[:, :dims, :dims]
 
     Z_followers = []
     Z_leaders = []
 
-    create_z_matrices(df, Z_followers, Z_leaders)
+        
+    create_z_matrices(df, Z_followers, Z_leaders, dims=dims, permute=permute)
 
     # find if any overlap in the z_positions
-
     Z_followers = torch.stack(Z_followers, dim=1).to(device)[:, :, :dims]
     Z_leaders = torch.stack(Z_leaders, dim=1).to(device)[:, :, :dims]
 
@@ -230,18 +260,18 @@ def association_loglikelihood_distance(
     d = (
         (
             Z_error.transpose(-1, -2)
-            @ torch.linalg.pinv(S, hermitian=True)[..., None, :, :]
+            @ torch.linalg.pinv(S, )[..., None, :, :]
             @ Z_error
         ).squeeze()
         + torch.logdet(S)[..., None]
         # + dims * torch.log(torch.tensor(2 * np.pi, dtype=torch.float32, device=device))
         # + two_pi
-    ).sqrt()
+    )
 
     d, _ = d.min(axis=-1)
-    d[
-        torch.isnan(d)
-    ] = 1  # replace nan with 0 (this happens when the determinant is near 0)
+    # d[
+    #     torch.isnan(d)
+    # ] = 1  # replace nan with 0 (this happens when the determinant is near 0)
 
     # d[s_overlap] = 0
 
@@ -634,7 +664,8 @@ class ImprovedFastCI(IMF):
             self.P_hat[t] = (
                     F @ self.P_hat[t - 1,] @ F.transpose(
                     -1, -2
-                ) + CALCFilter.Q_static(
+                ) 
+                + CALCFilter.Q_static(
                     dt_vect=self.Dt[t, :, 0],
                     shape=(self.v_dim, self.x_dim, self.x_dim),
                     speed_info=x_t[:, 0, 1],

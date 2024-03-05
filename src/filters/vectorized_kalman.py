@@ -34,7 +34,7 @@ def build_h_matrix() -> FloatTensor:
     )
 
 
-def build_r_matrix(pos_error: float = 0.3, d_pos_error: float = 0.3) -> FloatTensor:
+def build_r_matrix(pos_error: float = 0.5, d_pos_error: float = 0.5) -> FloatTensor:
     """
     Build the R matrix for the Kalman filter
 
@@ -45,17 +45,6 @@ def build_r_matrix(pos_error: float = 0.3, d_pos_error: float = 0.3) -> FloatTen
         0.1  # constant uncertainty based on the discretization of the frenet frame
     )
 
-    # return torch.Tensor(
-    #     np.array(
-    #         [
-    #             [pos_error + discretization_error, 0, 0, 0],
-    #             [0, 0.5 + discretization_error, 0, 0],
-    #             [0, 0, d_pos_error + discretization_error, 0],
-    #             [0, 0, 0, 0.5 + discretization_error],
-    #         ]
-    #     )
-    #     ** 2,
-    # )
     return torch.Tensor(
         np.array(
             [
@@ -63,9 +52,7 @@ def build_r_matrix(pos_error: float = 0.3, d_pos_error: float = 0.3) -> FloatTen
                     pos_error + discretization_error,
                     0,
                 ],
-                # [0, 0.5 + discretization_error, 0, 0],
                 [0, d_pos_error + discretization_error],
-                # [0, 0, 0, 0.5 + discretization_error],
             ]
         )
         ** 2,
@@ -120,7 +107,7 @@ class _VectorizedKalmanFilter:
 
     P_mod = 1
 
-    w_s = np.sqrt(4)
+    w_s = np.sqrt(2)
     w_d = np.sqrt(2)
 
     stop_speed_threshold = 0.5
@@ -194,9 +181,9 @@ class _VectorizedKalmanFilter:
             ).to(self._device)
         else:
             # this is for IMM filter, where predict_mask can be shared across filters
-            self._predict_mask: TensorType[
-                "time", "vehicle", "x_dim"
-            ] = predict_mask.to(self._device)
+            self._predict_mask: TensorType["time", "vehicle", "x_dim"] = (
+                predict_mask.to(self._device)
+            )
 
         # save the time differences
         if dt is None:
@@ -225,8 +212,6 @@ class _VectorizedKalmanFilter:
             )
         else:
             self._x[0, :, 1] = init_vel.clone()
-        # initialize the velocity
-        # self._x[0, :, 2] = df.filter(pl.col('time_ind'))
 
         # create P matrix
         self._P: TensorType["time", "vehicle", "x_dim", "x_dim"] = torch.zeros(
@@ -532,7 +517,7 @@ class _VectorizedKalmanFilter:
 
 class CALKFilter(_VectorizedKalmanFilter):
     # w_s = 10
-    w_d = 5
+    # w_d = 5
 
     def __init__(
         self,
@@ -644,7 +629,7 @@ class CALKFilter(_VectorizedKalmanFilter):
 
 class CVLKFilter(_VectorizedKalmanFilter):
     # w_s = 10
-    w_d = 1
+    # w_d = 1
 
     def __init__(
         self,
@@ -711,7 +696,7 @@ class CVLKFilter(_VectorizedKalmanFilter):
 
 class CALCFilter(_VectorizedKalmanFilter):
     # w_s = 10
-    w_d = 1
+    # w_d = 1
 
     def __init__(
         self,
@@ -877,11 +862,11 @@ class IMMFilter:
             dtype=torch.bool,
         )
 
-        self._predict_mask[
-            self._filters[0].inds[:, 0], self._filters[0].inds[:, 1]
-        ] = torch.BoolTensor(
-            df["prediction"].to_numpy(writable=True).astype(np.bool_),
-        ).to(self._device)
+        self._predict_mask[self._filters[0].inds[:, 0], self._filters[0].inds[:, 1]] = (
+            torch.BoolTensor(
+                df["prediction"].to_numpy(writable=True).astype(np.bool_),
+            ).to(self._device)
+        )
 
         self._compute_state_estimate(0)
 
@@ -997,9 +982,9 @@ class IMMFilter:
             *self.update_vectorized(t_ind)
         ).exp()
 
-        likelihoods[
-            likelihoods <= torch.finfo(likelihoods.dtype).min
-        ] = torch.finfo().min
+        likelihoods[likelihoods <= torch.finfo(likelihoods.dtype).min] = (
+            torch.finfo().min
+        )
 
         # update the mode probabilities. This is the spot! where they get updated
         # so have to use the last time step
@@ -1183,11 +1168,12 @@ def batch_imm_df(
         #     ).partition_by("chunk")
         # ):
         offset = chunk_df["vehicle_ind"].min()
+        chunk_df = chunk_df.with_columns(
+            (pl.col("vehicle_ind") - offset).alias("vehicle_ind")
+        )
 
         imm = IMMFilter(
-            chunk_df.with_columns(
-                (pl.col("vehicle_ind") - offset).alias("vehicle_ind")
-            ),
+            chunk_df,
             filters=filters,
             M=M,
             mu=mu,
@@ -1197,47 +1183,50 @@ def batch_imm_df(
         x_filt, p_filt = imm.apply_filter()
         mu_filt = imm._mu.cpu().numpy()
 
-        t_index = np.repeat(np.arange(imm.t_dim), imm.v_dim)
+        # t_index = np.repeat(np.arange(imm.t_dim), imm.v_dim)
         # v_index = np.tile(np.arange(imm.v_dim) + , imm.t_dim)
-        v_index = np.tile(np.arange(imm.v_dim), imm.t_dim) + offset
-        x_filt = x_filt.reshape(-1, imm.x_dim)
-        p_filt = p_filt.reshape(-1, imm.x_dim, imm.x_dim)
+        # v_index = np.tile(np.arange(imm.v_dim), imm.t_dim) + offset
+        # x_filt = x_filt.reshape(-1, imm.x_dim)
+        # p_filt = p_filt.reshape(-1, imm.x_dim, imm.x_dim)
         p_calc = (
             tuple(filter(lambda f: isinstance(f, CALCFilter), imm._filters))[0]
             .P
             # .detach()
             .cpu()
             .numpy()
-            .reshape(-1, imm.x_dim, imm.x_dim)
+            # .reshape(-1, imm.x_dim, imm.x_dim)
         )
-        mu_filt = mu_filt.reshape(-1, imm.f_dim)
+        # mu_filt = mu_filt.reshape(-1, imm.f_dim)
+
+        res_df = chunk_df.select(["time_ind", "vehicle_ind"]).clone()
+
+        x_filt = x_filt[res_df["time_ind"], res_df["vehicle_ind"]]
+        p_filt = p_filt[res_df["time_ind"], res_df["vehicle_ind"]]
+        p_calc = p_calc[res_df["time_ind"], res_df["vehicle_ind"]]
+        mu_filt = mu_filt[res_df["time_ind"], res_df["vehicle_ind"]]
+
         filts.append(
-            pl.DataFrame(
-                {
-                    "time_ind": t_index,
-                    "vehicle_ind": v_index,
-                    "s": x_filt[:, 0],
-                    "s_velocity": x_filt[:, 1],
-                    "s_accel": x_filt[:, 2],
-                    "d": x_filt[:, 3],
-                    "d_velocity": x_filt[:, 4],
-                    "d_accel": x_filt[:, 5],
-                    "P": pa.FixedSizeListArray.from_arrays(
-                        p_filt.reshape(-1), imm.x_dim * imm.x_dim
-                    ),
-                    "P_CALC": pa.FixedSizeListArray.from_arrays(
-                        p_calc.reshape(-1), imm.x_dim * imm.x_dim
-                    ),
-                    **{
-                        f"mu_{f}": mu_filt[:, i]
-                        for i, f in enumerate(filt.upper() for filt in filters)
-                    },
-                }
-            ).with_columns(
-                [
-                    pl.col("time_ind").cast(pl.Int32),
-                    pl.col("vehicle_ind").cast(pl.Int32),
-                ]
+            res_df
+            .with_columns(
+                s=pl.Series(x_filt[:, 0]),
+                s_velocity=pl.Series(x_filt[:, 1]),
+                s_accel=pl.Series(x_filt[:, 2]),
+                d=pl.Series(x_filt[:, 3]),
+                d_velocity=pl.Series(x_filt[:, 4]),
+                d_accel=pl.Series(x_filt[:, 5]),
+                P=pl.Series(pa.FixedSizeListArray.from_arrays(
+                    p_filt.reshape(-1), imm.x_dim * imm.x_dim
+                )),
+                P_CALC=pl.Series(pa.FixedSizeListArray.from_arrays(
+                    p_calc.reshape(-1), imm.x_dim * imm.x_dim
+                )),
+            )
+            .with_columns(
+                pl.Series(mu_filt[:, i]).alias(f"mu_{f}")
+                for i, f in enumerate(filt.upper() for filt in filters)
+            )
+            .with_columns(
+                pl.col('vehicle_ind') + offset
             )
         )
 

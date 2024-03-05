@@ -122,10 +122,11 @@ def build_extension(
     id_cols: Tuple[str] = ("kalman_id",),
 ) -> pl.DataFrame:
     # take the last data point from the radar, and then extend it
-    df = df.lazy()
-
+    # df = df.lazy()
+    dt = dt * 1000
     return (
-        df.lazy()
+        df
+        .lazy()
         .group_by(id_cols)
         .agg(
             pl.col("epoch_time").min(),
@@ -138,23 +139,24 @@ def build_extension(
             ).alias("total_duration_s"),
         )
         .with_columns(
-            ((pl.col("total_duration_s") + seconds) / dt).cast(int).alias("n_steps"),
-            pl.lit(dt).alias("dt"),
+            ((pl.col("total_duration_s") + seconds) / (dt / 1000)).cast(int).alias("n_steps"),
+            # pl.lit(dt * 1000).cast(int).alias("dt"),
+            pl.lit(dt).cast(int).alias("dt"),
         )
         .with_columns(
             pl.col("dt").repeat_by(pl.col("n_steps")).alias("dt"),
         )
         .explode("dt")
-        .with_columns((pl.col("dt").cumsum() * 1000).cast(int).over(id_cols))
+        .with_columns((pl.col("dt").cumsum()).cast(int).over(id_cols))
         .with_columns(
             (pl.duration(milliseconds="dt") + pl.col("epoch_time"))
             .dt.round(every="100ms")
             .alias("epoch_time")
         )
         .with_columns((pl.col("epoch_time") > pl.col("max_time")).alias("prediction"))
-        .drop(["dt", "n_steps", "total_duration_s", "max_time"])
+        .drop(["dt", "n_steps", "total_duration_s", ])
         .join(
-            df.with_columns(
+            df.lazy().with_columns(
                 pl.lit(False).alias("missing_data"),
                 pl.col("epoch_time").dt.round(every="100ms"),
             ),
@@ -162,7 +164,9 @@ def build_extension(
             how="left",
         )
         .filter(
-            ~((pl.col('object_id').cum_count() == 0) & (pl.col('object_id').is_null())).over(id_cols)
+            ~(
+                (pl.col("object_id").cum_count() == 0) & (pl.col("object_id").is_null())
+            ).over(id_cols)
         )
         .sort(by=[*id_cols, "epoch_time"])
         .with_columns(
@@ -170,13 +174,16 @@ def build_extension(
             pl.col("prediction").fill_null(False),
         )
         .with_columns(
-            pl.col(set(df.columns) - {"prediction", "missing_data"}).forward_fill()
+            pl.col(
+                set(df.columns) - {"prediction", "missing_data"}
+            ).forward_fill()
         )
-        .collect()
+        .collect(streaming=True)
         .rechunk()
         .set_sorted(["object_id", "lane", "epoch_time"])
         .lazy()
     )
+
 
 #     return test
 # @lazify
@@ -321,7 +328,7 @@ def build_kalman_df(
                 pl.col("prediction"),
                 pl.col("missing_data"),
                 pl.col("epoch_time").cum_count().over("kalman_id").alias("time_ind"),
-                pl.col('s_velocity')
+                pl.col("s_velocity"),
             ]
         )
         .with_columns(
