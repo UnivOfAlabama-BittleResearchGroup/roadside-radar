@@ -3,6 +3,8 @@ import numpy as np
 import polars as pl
 from src.filters.fusion import association_loglikelihood_distance
 from src.pipelines.utils import lazify, timeit
+from scipy.stats import chi2
+import networkx as nx
 
 
 @lazify
@@ -356,13 +358,16 @@ def calculate_match_indexes(
         df.lazy()
         .with_columns(
             # sort the object id and leader
-            pl.struct(
-                [
-                    pl.col("leader"),
-                    pl.col("object_id"),
-                ]
-            )
-            # .hash()
+            pl.when(pl.col("leader") < pl.col("object_id"))
+            .then(pl.concat_list([pl.col("leader"), pl.col("object_id")]))
+            .otherwise(pl.concat_list([pl.col("object_id"), pl.col("leader")]))
+            # pl.struct(
+            #     [
+            #         pl.col("leader"),
+            #         pl.col("object_id"),
+            #     ]
+            # )
+            # # .hash()
             .alias("pair")
         )
         .with_columns(
@@ -378,10 +383,13 @@ def calculate_match_indexes(
         )
         # .with_columns(pl.col("match_time"))
         .filter(
-            ((~pl.col("prediction_any")) | (pl.col("match_time") < min_time_threshold))
-            # & pl.col("match_time") < 
+            (
+                (~pl.col("prediction_any"))
+                | (pl.col("match_time") < min_time_threshold)
+                # & pl.col("match_time") <
+            )
         )
-        .sort(["pair", "match_time"])
+        # .sort(["match_time"])
         .with_columns(
             [
                 # ----------- Calculate the Time Headway ------------
@@ -397,39 +405,77 @@ def calculate_match_indexes(
                 # find the end index to use
             ]
         )
-        .with_columns(
-            pl.when(pl.col("prediction_any"))
-            .then(pl.col("sort_index").max())
-            .otherwise(pl.col("sort_index"))
-            .over("pair")
-            .alias("sort_index"),
+        # .with_columns(
+        #     pl.when(pl.col("prediction_any"))
+        #     .then(pl.col("sort_index").max())
+        #     .otherwise(pl.col("sort_index"))
+        #     .over("pair")
+        #     .alias("sort_index"),
+        # )
+        .sort(
+            ["epoch_time"],
         )
-        .sort(["pair", "sort_index", "epoch_time"], descending=[False, False, True])
     )
+
+
+# @timeit
+# @lazify
+# def pipe_gate_headway_calc(
+#     df: pl.DataFrame,
+#     alpha: float = 0.1,
+#     window: int = 20,
+# ) -> pl.DataFrame:
+#     return df.group_by(
+#         "pair",
+#     ).agg(
+#         pl.col("association_distance")
+#         .rolling_mean(window_size=window, min_periods=1)
+#         # .median()
+#         # .quantile(0.5)
+#         .min()
+#         .alias("association_distance_filt"),
+#         pl.col("epoch_time").first().alias("epoch_time"),
+#         pl.col('epoch_time').last().alias('epoch_time_max'),
+
+#         pl.col("prediction").any().alias("prediction"),
+#         pl.col("prediction_leader").any().alias("prediction_leader"),
+#         # pl.col("headway").ewm_mean(alpha=alpha).mean().alias("headway"),
+#         pl.col("headway").mean().alias("headway"),
+#         pl.col("s_leader").first().alias("leader_s"),
+#         pl.col("s").first().alias("s"),
+#     )
 
 
 @timeit
 @lazify
 def pipe_gate_headway_calc(
     df: pl.DataFrame,
-    alpha: float = 0.9,
+    alpha: float = 0.1,
+    window: int = 20,
+    association_dist_cutoff: float = chi2.ppf(0.95, 4),
 ) -> pl.DataFrame:
-    return df.group_by(
-        "pair",
-    ).agg(
-        pl.col("association_distance")
-        # .ewm_mean(alpha=alpha)
-        # .median()
-        # .quantile(0.5)
-        .mean()
-        .alias("association_distance_filt"),
-        pl.col("epoch_time").first().alias("epoch_time"),
-        pl.col("prediction").any().alias("prediction"),
-        pl.col("prediction_leader").any().alias("prediction_leader"),
-        # pl.col("headway").ewm_mean(alpha=alpha).mean().alias("headway"),
-        pl.col("headway").mean().alias("headway"),
-        pl.col("s_leader").first().alias("leader_s"),
-        pl.col("s").first().alias("s"),
+    return (
+        df.with_columns(
+            pl.col("association_distance")
+            .rolling_mean(window_size=window, min_periods=1)
+            .over("pair")
+        )
+        .group_by("pair")
+        .agg(
+            pl.col("association_distance").min().alias("association_distance_filt"),
+            pl.col("epoch_time")
+            .filter(pl.col("association_distance") < association_dist_cutoff)
+            .first()
+            .alias("join_time"),
+            pl.col("epoch_time").first().alias("epoch_time"),
+            pl.col("epoch_time").last().alias("epoch_time_max"),
+            pl.col("prediction").any().alias("prediction"),
+            pl.col("prediction_leader").any().alias("prediction_leader"),
+            # pl.col("headway").ewm_mean(alpha=alpha).mean().alias("headway"),
+            pl.col("headway").mean().alias("headway"),
+            pl.col("s_leader").first().alias("leader_s"),
+            pl.col("s").first().alias("s"),
+        )
     )
 
 
@@ -444,9 +490,14 @@ def build_match_df(
     # headway_cutoff_inner: float,
 ) -> pl.DataFrame:
     valid_matches = (
-        df.lazy()
+        df
+        # .lazy()
         .sort("epoch_time")
-        .unnest("pair")
+        # .unnest("pair")
+        .with_columns(
+            pl.col("pair").list.get(0).alias("object_id"),
+            pl.col("pair").list.get(1).alias("leader"),
+        )
         .with_row_count()
         .join(
             traj_time_df.lazy(),
@@ -480,45 +531,46 @@ def build_match_df(
                 pl.when(~(pl.col("prediction") | pl.col("prediction_leader")))
                 .then(pl.col("association_distance_filt") <= assoc_cutoff)
                 .otherwise(pl.col("association_distance_filt") <= assoc_cutoff_pred)
+                # | (pl.col("headway") < time_headway_cutoff)
             )
-            | (pl.col("headway") < time_headway_cutoff)
         )
-        .sort("value", "epoch_time")
-        .with_columns(
-            pl.when(pl.col("variable") == "object_id")
-            .then(pl.col("prediction"))
-            .otherwise(pl.col("prediction_leader"))
-            .alias("prediction"),
-            pl.when(pl.col("variable") == "object_id")
-            .then(pl.col("epoch_time_max"))
-            .otherwise(pl.col("epoch_time_max_leader"))
-            .alias("my_end_time"),
-            pl.when(pl.col("variable") == "object_id")
-            .then(pl.col("epoch_time_max_leader"))
-            .otherwise(pl.col("epoch_time_max"))
-            .alias("other_end_time"),
-        )
-        .drop(
-            ["epoch_time_max", "epoch_time_max_leader", "prediction_leader", "variable"]
-        )
-        .with_columns(
-            pl.col("prediction").cumsum().over("value").alias("prediction_count"),
-            pl.col("other_end_time")
-            .filter(~pl.col("prediction"))
-            .max()
-            .over("value")
-            .alias("other_end_time_max"),
-        )
-        # .filter(
-        #     (pl.col("prediction_count") <= 1)
-        #     & (pl.col("row_nr").count().over("row_nr") > 1)
+        # .sort("epoch_time")
+        # .with_columns(
+        #     pl.when(pl.col("variable") == "object_id")
+        #     .then(pl.col("prediction"))
+        #     .otherwise(pl.col("prediction_leader"))
+        #     .alias("prediction"),
+        #     pl.when(pl.col("variable") == "object_id")
+        #     .then(pl.col("epoch_time_max"))
+        #     .otherwise(pl.col("epoch_time_max_leader"))
+        #     .alias("my_end_time"),
+        #     pl.when(pl.col("variable") == "object_id")
+        #     .then(pl.col("epoch_time_max_leader"))
+        #     .otherwise(pl.col("epoch_time_max"))
+        #     .alias("other_end_time"),
         # )
+        # .drop(
+        #     ["epoch_time_max", "epoch_time_max_leader", "prediction_leader", "variable"]
+        # )
+        # .with_columns(
+        #     pl.col("prediction").cumsum().over("value").alias("prediction_count"),
+        #     pl.col("other_end_time")
+        #     .filter(~pl.col("prediction"))
+        #     .max()
+        #     .over("value")
+        #     .alias("other_end_time_max"),
+        # )
+        # # .filter(
+        # #     (pl.col("prediction_count") <= 1)
+        # #     & (pl.col("row_nr").count().over("row_nr") > 1)
+        # # )
         .collect()
     )
 
     return valid_matches.filter(
         pl.col("row_nr").is_in(keep_rows["row_nr"].unique())
     ).drop("row_nr")
+    # return valid_matches
 
 
 @timeit
@@ -529,22 +581,18 @@ def create_vehicle_ids(
 ) -> pl.DataFrame:
     import networkx as nx
 
-    # create a bidirectional graph of connections, with the weight being the time difference
-    g = nx.Graph(
-        [
-            (d["object_id"], d["leader"])
-            for d in match_df.select(
-                [
-                    "object_id",
-                    "leader",
-                ]
-            ).to_dicts()
-        ]
-    )
+    g = nx.Graph()
 
+    # create a bidirectional graph of connections, with the weight being the time difference
+
+    for d in match_df.select(
+        ["object_id", "leader", "association_distance_filt"]
+    ).to_dicts():
+        g.add_edge(d["object_id"], d["leader"], weight=d["association_distance_filt"])
+
+    # return
     # get all the connected components
     cc = list(nx.connected_components(g))
-
     # create a dataframe of the connected components
     cc_df = pl.DataFrame(
         {
@@ -552,7 +600,7 @@ def create_vehicle_ids(
             "vehicle_id": [i for i, x in enumerate(cc) for _ in x],
         },
         schema={
-            "object_id": pl.UInt64,
+            "object_id": pl.UInt32,
             "vehicle_id": pl.UInt64,
         },
     )
@@ -568,7 +616,7 @@ def create_vehicle_ids(
         .select(["object_id", "vehicle_id"])
     )
 
-    return df.join(cc_df, on="object_id", how="left")
+    return cc, g, df.join(cc_df, on="object_id", how="left")
 
 
 @timeit
@@ -750,3 +798,31 @@ def filter_bad_lane_matches(
             .collect(streaming=True)["pair"]
         )
     )
+
+
+def _walk_internal(score_func, g, edges,) -> float:
+    # for row in df.select(['object_id', 'leader_id']):
+    score = score_func(
+            g.copy(),
+            edges
+        )
+
+    return score
+
+
+
+def walk_graph_removals(g: nx.Graph, max_removals: int = 3, score_func: callable = None):
+    remove_edges = []
+    for i in range(max_removals):
+        scores = []
+        for edge in g.edges:
+            score = _walk_internal(
+                score_func,
+                g,
+                [edge],
+            )
+            score = np.mean([s for s in score if s is not None])
+            scores.append((score, edge))
+        scores.sort()
+        remove_edges.append(scores[0][1])
+        g.remove_edge(*scores[0][1])

@@ -107,8 +107,8 @@ class _VectorizedKalmanFilter:
 
     P_mod = 1
 
-    w_s = np.sqrt(2)
-    w_d = np.sqrt(2)
+    w_s = np.sqrt(4)
+    w_d = np.sqrt(0.8)
 
     stop_speed_threshold = 0.5
 

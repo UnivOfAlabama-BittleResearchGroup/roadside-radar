@@ -1,4 +1,4 @@
-polars
+polars==0.20.3
 python-dotenv
 requests
 geopandas

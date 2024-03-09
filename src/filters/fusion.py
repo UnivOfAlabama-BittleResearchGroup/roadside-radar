@@ -10,7 +10,7 @@ from scipy.stats import chi2
 
 from src.filters.vectorized_kalman import (
     # build_h_matrix,
-    build_r_matrix,
+    # build_r_matrix,
     CALKFilter,
     CVLKFilter,
     CALCFilter,
@@ -20,11 +20,9 @@ from src.filters.vectorized_kalman import (
 
 
 def create_z_matrices_permute(df, Z_followers, Z_leaders, column_creator):
-
     positions = ["s", "front_s", "back_s"]
     # Create all combinations of leader and follower positions
     for follower_pos, leader_pos in permutations(positions, 2):
-        
         # Append follower data to Z_followers
         Z_followers.append(
             torch.from_numpy(
@@ -58,7 +56,7 @@ def build_h_matrix(dims: int = 4) -> torch.FloatTensor:
         return torch.FloatTensor(
             np.eye(6),
         )
-    
+
     elif dims == 4:
         return torch.FloatTensor(
             np.array(
@@ -81,8 +79,54 @@ def build_h_matrix(dims: int = 4) -> torch.FloatTensor:
         )
 
 
-def create_z_matrices(df, Z_followers, Z_leaders, pos_override=None, dims: int = 4, permute: bool = False):
-    
+def build_r_matrix(
+    pos_error: float = 1.5,
+    d_pos_error: float = 1.5,
+    dims: int = 4,
+) -> torch.FloatTensor:
+    """
+    Build the R matrix for the Kalman filter.
+
+    IDK why this is a function, but it is. ChatGPT made me do it
+    """
+    if dims == 6:
+        return torch.FloatTensor(
+            np.diag(
+                [
+                    pos_error,
+                    1,
+                    1,
+                    d_pos_error,
+                    1,
+                    1,
+                ]
+            ),
+        )
+    elif dims == 4:
+        return torch.FloatTensor(
+            np.diag(
+                [
+                    pos_error,
+                    1,
+                    d_pos_error,
+                    1,
+                ]
+            ),
+        )
+    elif dims == 2:
+        return torch.FloatTensor(
+            np.diag(
+                [
+                    pos_error,
+                    d_pos_error,
+                ]
+            ),
+        )
+
+
+def create_z_matrices(
+    df, Z_followers, Z_leaders, pos_override=None, dims: int = 4, permute: bool = False
+):
     def column_creator(pos, ext):
         if dims == 6:
             return [
@@ -105,19 +149,17 @@ def create_z_matrices(df, Z_followers, Z_leaders, pos_override=None, dims: int =
                 f"{pos}{ext}",
                 f"d{ext}",
             ]
-    
+
     if permute:
         return create_z_matrices_permute(df, Z_followers, Z_leaders, column_creator)
-    
+
     if pos_override is None:
         pos_override = ["s", "front_s", "back_s"]
     for pos in pos_override:
         for ext, l in zip(["_leader", ""], [Z_leaders, Z_followers]):
             l.append(
                 torch.from_numpy(
-                    df[
-                        column_creator(pos, ext)
-                    ]
+                    df[column_creator(pos, ext)]
                     .to_numpy()
                     .copy()
                     .reshape(-1, dims, 1)
@@ -136,7 +178,7 @@ def loglikelihood(
 
     H = build_h_matrix().to(torch.float32).to(device)
 
-    # R = build_r_matrix().to(torch.float32).to(device)
+    R = build_r_matrix(pos_error=2.5, d_pos_error=1).to(torch.float32).to(device)
 
     P_leader = torch.from_numpy(
         df["P_leader"]
@@ -148,7 +190,7 @@ def loglikelihood(
         )
     ).to(device)
 
-    S_leader = H @ P_leader @ H.T #+ R
+    S_leader = H @ P_leader @ H.T + R
 
     Z_followers = []
     Z_leaders = []
@@ -191,8 +233,8 @@ def association_loglikelihood_distance(
     device = pick_device(gpu)
 
     H = build_h_matrix(dims=dims).to(device)
-    # R = build_r_matrix(d_pos_error=1.38, pos_error=2).to(device)
-    R = build_r_matrix().to(device)
+    R = build_r_matrix(d_pos_error=1.38, pos_error=2, dims=dims).to(device)
+    # R = build_r_matrix().to(device)
 
     P = torch.from_numpy(
         df["P_leader"]
@@ -228,17 +270,16 @@ def association_loglikelihood_distance(
     #         .ravel()
     #         # / 2
     #     ).to(device)
-    
+
     # S = R
-    S = H @ P @ H.T 
-    if dims == 2:
-        S += R
+    S = H @ P @ H.T
+    # if dims == 2:
+    S += R
     S = S[:, :dims, :dims]
 
     Z_followers = []
     Z_leaders = []
 
-        
     create_z_matrices(df, Z_followers, Z_leaders, dims=dims, permute=permute)
 
     # find if any overlap in the z_positions
@@ -260,7 +301,9 @@ def association_loglikelihood_distance(
     d = (
         (
             Z_error.transpose(-1, -2)
-            @ torch.linalg.pinv(S, )[..., None, :, :]
+            @ torch.linalg.pinv(
+                S,
+            )[..., None, :, :]
             @ Z_error
         ).squeeze()
         + torch.logdet(S)[..., None]
@@ -468,7 +511,7 @@ class IMF:
 
             # predict the individual measurements
             x_t_t1 = (F @ self.X[t - 1].unsqueeze(-1)).squeeze()
-            p_t_t1 = F @ self.P[t - 1] @ F.transpose(-1, -2) #+ Q
+            p_t_t1 = F @ self.P[t - 1] @ F.transpose(-1, -2)  # + Q
 
             # precompute the inverse
             p_hat_t_t1_i = torch.linalg.pinv(p_hat_t_t1, hermitian=True)
@@ -582,7 +625,7 @@ class CI(IMF):
             ).to(self.device)
 
             self.X_hat[t] = (F @ self.X_hat[t - 1,].unsqueeze(-1)).squeeze()
-            self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2) #+ Q
+            self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2)  # + Q
             # do the recursive update
             # for z in range(self.z_dim, ):
             # update in reverse order
@@ -652,7 +695,10 @@ class ImprovedFastCI(IMF):
         for t in tqdm(range(1, self.t_dim)):
             x_t = self.X[t]
             # clamp the P matrix to be positive definite
-            self.P[t, ...] = torch.clamp(self.P[t, ...], min=1e-9, )
+            self.P[t, ...] = torch.clamp(
+                self.P[t, ...],
+                min=1e-9,
+            )
             p_t = self.P[t]  # + P_mod
 
             F = CALCFilter.F_static(
@@ -661,29 +707,26 @@ class ImprovedFastCI(IMF):
             ).to(self.device)
 
             self.X_hat[t] = (F @ self.X_hat[t - 1,].unsqueeze(-1)).squeeze()
-            self.P_hat[t] = (
-                    F @ self.P_hat[t - 1,] @ F.transpose(
-                    -1, -2
-                ) 
-                + CALCFilter.Q_static(
-                    dt_vect=self.Dt[t, :, 0],
-                    shape=(self.v_dim, self.x_dim, self.x_dim),
-                    speed_info=x_t[:, 0, 1],
-                ).to(self.device)
-            )
+            self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2)
 
             for z in range(self.z_dim):
                 mask = x_t[:, z].abs().sum(axis=-1) > 0.1
 
-                I_i = torch.linalg.pinv(p_t[mask, z], )
-                I_hat = torch.linalg.pinv(self.P_hat[t, mask], )
+                I_i = torch.linalg.pinv(
+                    p_t[mask, z],
+                )
+                I_hat = torch.linalg.pinv(
+                    self.P_hat[t, mask],
+                )
                 d_i = determinant(I_hat + I_i)
                 omega = (d_i - determinant(I_i) + determinant(I_hat)) / (2 * d_i)
 
                 a1 = omega[..., None, None] * I_hat
                 a2 = (1 - omega[..., None, None]) * I_i
 
-                self.P_hat[t, mask] = torch.linalg.pinv(a1 + a2,)
+                self.P_hat[t, mask] = torch.linalg.pinv(
+                    a1 + a2,
+                )
                 self.X_hat[t, mask] = (
                     self.P_hat[t, mask]
                     @ (
@@ -724,7 +767,6 @@ class MeasurementCI(IMF):
             z_hat_t = self.X_hat[t] @ H.T
 
             for z in range(self.z_dim):
-                
                 mask = x_t[:, z].abs().sum(axis=-1) > 0.1
 
                 y = z_t[mask, z] - z_hat_t[mask]

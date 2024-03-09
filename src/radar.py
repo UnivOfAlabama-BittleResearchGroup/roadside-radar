@@ -67,11 +67,28 @@ class BasicRadar:
             < (pl.col("f32_positionY_m") * np.tan(crop_angle))
         )
 
+    # @classmethod
+    # @timeit
+    # def create_object_id(cls, df: pl.DataFrame) -> pl.DataFrame:
+    #     # make the object id the ui32_objectId + the ip + the date
+    #     return df.with_columns(
+    #         [
+    #             pl.struct(
+    #                 [
+    #                     pl.col("ui32_objectID").cast(pl.Utf8),
+    #                     pl.col("ip").cast(pl.Utf8),
+    #                     pl.col("epoch_time").dt.strftime("%Y-%m-%d"),
+    #                 ],
+    #             )
+    #             .hash()
+    #             .alias("object_id"),
+    #         ]
+    #     )
+
     @classmethod
     @timeit
     def create_object_id(cls, df: pl.DataFrame) -> pl.DataFrame:
-        # make the object id the ui32_objectId + the ip + the date
-        return df.with_columns(
+        df = df.with_columns(
             [
                 pl.struct(
                     [
@@ -81,9 +98,17 @@ class BasicRadar:
                     ],
                 )
                 .hash()
-                .alias("object_id"),
+                .alias("hashed_object_id"),
             ]
         )
+
+        return df.join(
+            df.select(pl.col("hashed_object_id").unique()).with_row_count(
+                name="object_id"
+            ),
+            on="hashed_object_id",
+            how="left",
+        ).drop(["hashed_object_id"])
 
     @classmethod
     @timeit
@@ -885,6 +910,7 @@ class CalibratedRadar(BasicRadar):
         self, df: pl.DataFrame, col_name: str = "h3", resolution: int = None
     ) -> pl.DataFrame:
         import h3.api.numpy_int as h3
+
         return df.with_column(
             pl.struct(["lat", "lon"])
             .apply(
