@@ -812,9 +812,8 @@ def get_graph_score(
     sub_graph: nx.Graph,
     df: pl.DataFrame,
     remove_edges: List[int] = (),
-    add_edges: List[int] = ()
+    add_edges: List[int] = (),
 ) -> float:
-    
     for remove in remove_edges:
         sub_graph.remove_edge(*remove)
 
@@ -829,29 +828,28 @@ def get_graph_score(
             for start, end in combinations(subgraph, 2)
         ]
 
-        score = df.filter(
-            pl.col('pair_str').is_in(combs)
-        )['association_distance_filt'].mean()
+        score = df.filter(pl.col("pair_str").is_in(combs))[
+            "association_distance_filt"
+        ].mean()
 
         if score is not None:
-            scores.append(score )
-    
-    return scores
+            scores.append(score)
 
+    return scores
 
 
 def walk_graph_removals(
     g: nx.Graph,
     cutoff: float = chi2.ppf(0.95, 4),
     max_removals: int = 3,
-    df: pl.DataFrame = None
+    df: pl.DataFrame = None,
 ):
     i = 0
     remove_edges = []
     graph_scores = []
 
     while i == 0 or (
-        (i < max_removals) and not all(s[0] < cutoff for s in graph_scores[-1])
+        (i < max_removals) and not all(s < cutoff for s in graph_scores[-1])
     ):
         # for _ in range(max_removals):
         scores = []
@@ -860,7 +858,7 @@ def walk_graph_removals(
                 # score_func,
                 g.copy(),
                 df,
-                remove_edges=[edge]
+                remove_edges=[edge],
             )
             # score = np.mean([s for s in score if s is not None])
             scores.append((score, edge))
@@ -873,26 +871,37 @@ def walk_graph_removals(
 
         i += 1
 
-    # now loop and see if we can add any edges back and still satisfy the requirements. 
+    # now loop and see if we can add any edges back and still satisfy the requirements.
     # This happends for multiple reasons
-    for edge in remove_edges:
-        score = get_graph_score(
-            g.copy(),
-            df,
-            add_edges=[edge]
-        )
+    # delete_edges = remove_edges.copy()
+    pop_edges = []
+    for i, edge in enumerate(remove_edges):
+        score = get_graph_score(g.copy(), df, add_edges=[edge])
 
-        # if score
+        if all(s < cutoff for s in score):
+            pop_edges.append(i)
+            g.add_edge(*edge)
+
+    # graph_scores
+    remove_edges = [
+        remove_edges[i] for i in range(len(remove_edges)) if i not in pop_edges
+    ]
+    graph_scores = [
+        graph_scores[i] for i in range(len(graph_scores)) if i not in pop_edges
+    ]
 
     return pl.DataFrame(
         {
-            'remove_edges': remove_edges,
-            'graph_scores': graph_scores,
-            'vehicle_index': [df['vehicle_index'][0], ] * i
+            "remove_edges": remove_edges,
+            "graph_scores": graph_scores,
+            "vehicle_index": [
+                df["vehicle_index"][0],
+            ]
+            * len(remove_edges),
         }
     )
 
-    return remove_edges, graph_scores
+    # return remove_edges, graph_scores
 
 
 # parallelize the graph walking
