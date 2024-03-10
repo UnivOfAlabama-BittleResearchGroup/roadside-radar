@@ -1,4 +1,6 @@
 from datetime import timedelta
+from itertools import combinations
+from typing import List
 import numpy as np
 import polars as pl
 from src.filters.fusion import association_loglikelihood_distance
@@ -606,7 +608,7 @@ def create_vehicle_ids(
     )
 
     cc_df = cc_df.vstack(
-        df.select(pl.col("object_id").unique())
+        df.select(pl.col("object_id").unique().cast(pl.UInt32))
         .filter(~pl.col("object_id").is_in(cc_df["object_id"]))
         .with_row_count(
             "vehicle_id",
@@ -616,7 +618,13 @@ def create_vehicle_ids(
         .select(["object_id", "vehicle_id"])
     )
 
-    return cc, g, df.join(cc_df, on="object_id", how="left")
+    return (
+        cc,
+        g,
+        df.with_columns(pl.col("object_id").cast(pl.UInt32)).join(
+            cc_df, on="object_id", how="left"
+        ),
+    )
 
 
 @timeit
@@ -800,29 +808,92 @@ def filter_bad_lane_matches(
     )
 
 
-def _walk_internal(score_func, g, edges,) -> float:
-    # for row in df.select(['object_id', 'leader_id']):
-    score = score_func(
-            g.copy(),
-            edges
-        )
+def get_graph_score(
+    sub_graph: nx.Graph,
+    df: pl.DataFrame,
+    remove_edges: List[int] = (),
+    add_edges: List[int] = ()
+) -> float:
+    
+    for remove in remove_edges:
+        sub_graph.remove_edge(*remove)
 
-    return score
+    for add_edge in add_edges:
+        sub_graph.add_edge(*add_edge)
+
+    # return score
+    scores = []
+    for subgraph in nx.connected_components(sub_graph):
+        combs = [
+            f"{start}-{end}" if start < end else f"{end}-{start}"
+            for start, end in combinations(subgraph, 2)
+        ]
+
+        score = df.filter(
+            pl.col('pair_str').is_in(combs)
+        )['association_distance_filt'].mean()
+
+        if score is not None:
+            scores.append(score )
+    
+    return scores
 
 
 
-def walk_graph_removals(g: nx.Graph, max_removals: int = 3, score_func: callable = None):
+def walk_graph_removals(
+    g: nx.Graph,
+    cutoff: float = chi2.ppf(0.95, 4),
+    max_removals: int = 3,
+    df: pl.DataFrame = None
+):
+    i = 0
     remove_edges = []
-    for i in range(max_removals):
+    graph_scores = []
+
+    while i == 0 or (
+        (i < max_removals) and not all(s[0] < cutoff for s in graph_scores[-1])
+    ):
+        # for _ in range(max_removals):
         scores = []
         for edge in g.edges:
-            score = _walk_internal(
-                score_func,
-                g,
-                [edge],
+            score = get_graph_score(
+                # score_func,
+                g.copy(),
+                df,
+                remove_edges=[edge]
             )
-            score = np.mean([s for s in score if s is not None])
+            # score = np.mean([s for s in score if s is not None])
             scores.append((score, edge))
-        scores.sort()
+
+        # store the scores
+        scores = sorted(scores, key=lambda x: np.mean(x[0]))
         remove_edges.append(scores[0][1])
+        graph_scores.append(scores[0][0])
         g.remove_edge(*scores[0][1])
+
+        i += 1
+
+    # now loop and see if we can add any edges back and still satisfy the requirements. 
+    # This happends for multiple reasons
+    for edge in remove_edges:
+        score = get_graph_score(
+            g.copy(),
+            df,
+            add_edges=[edge]
+        )
+
+        # if score
+
+    return pl.DataFrame(
+        {
+            'remove_edges': remove_edges,
+            'graph_scores': graph_scores,
+            'vehicle_index': [df['vehicle_index'][0], ] * i
+        }
+    )
+
+    return remove_edges, graph_scores
+
+
+# parallelize the graph walking
+# def walk_graph_removals_d()

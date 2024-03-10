@@ -256,26 +256,11 @@ def association_loglikelihood_distance(
         )
     ).to(device)
 
-    # if augment_length:
-    #     P[:, 0, 0] += torch.from_numpy(
-    #         df.with_columns(
-    #             [pl.lit(2.5).alias("length_s_fixed")],
-    #         )
-    #         .select(
-    #             *length_cols,
-    #             "length_s_fixed",
-    #         )
-    #         .max_horizontal()
-    #         .to_numpy(writable=True)
-    #         .ravel()
-    #         # / 2
-    #     ).to(device)
-
     # S = R
     S = H @ P @ H.T
     # if dims == 2:
     S += R
-    S = S[:, :dims, :dims]
+    # S = S
 
     Z_followers = []
     Z_leaders = []
@@ -283,40 +268,24 @@ def association_loglikelihood_distance(
     create_z_matrices(df, Z_followers, Z_leaders, dims=dims, permute=permute)
 
     # find if any overlap in the z_positions
-    Z_followers = torch.stack(Z_followers, dim=1).to(device)[:, :, :dims]
-    Z_leaders = torch.stack(Z_leaders, dim=1).to(device)[:, :, :dims]
+    Z_followers = torch.stack(Z_followers, dim=1).to(device)
+    Z_leaders = torch.stack(Z_leaders, dim=1).to(device)
 
     Z_error = Z_followers - Z_leaders
 
-    # s_overlap = (
-    #     torch.min(
-    #         Z_leaders[:, :, 0].max(axis=1)[0], Z_followers[:, :, 0].max(axis=1)[0]
-    #     )
-    #     - torch.max(
-    #         Z_leaders[:, :, 0].min(axis=1)[0], Z_followers[:, :, 0].min(axis=1)[0]
-    #     )
-    #     > 0
-    # ).any(axis=-1)
-
     d = (
-        (
-            Z_error.transpose(-1, -2)
-            @ torch.linalg.pinv(
-                S,
-            )[..., None, :, :]
-            @ Z_error
-        ).squeeze()
-        + torch.logdet(S)[..., None]
-        # + dims * torch.log(torch.tensor(2 * np.pi, dtype=torch.float32, device=device))
-        # + two_pi
+        (Z_error.transpose(-1, -2) @ S.inverse()[..., None, :, :] @ Z_error).squeeze()
+        # + torch.logdet(S)[..., None]
     )
-
-    d, _ = d.min(axis=-1)
-    # d[
-    #     torch.isnan(d)
-    # ] = 1  # replace nan with 0 (this happens when the determinant is near 0)
-
-    # d[s_overlap] = 0
+    # this is the associtiation liklihood bit
+    if device.type == "mps":
+        d = d.detach().cpu() + torch.logdet(S.cpu())[..., None]
+        
+    else:
+        d += torch.logdet(S)[..., None]
+        d = d.detach()
+    
+    d = d.min(axis=-1)[0].numpy()
 
     # zero out all local tensors
     del Z_followers
@@ -324,9 +293,9 @@ def association_loglikelihood_distance(
     del Z_error
     del P
     del S
-    torch.cuda.empty_cache()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
-    d = d.detach().cpu().numpy()
     gc.collect()
 
     return df.with_columns(
