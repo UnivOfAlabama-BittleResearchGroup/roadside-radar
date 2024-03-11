@@ -274,7 +274,7 @@ def association_loglikelihood_distance(
     Z_error = Z_followers - Z_leaders
 
     d = (
-        (Z_error.transpose(-1, -2) @ S.inverse()[..., None, :, :] @ Z_error).squeeze()
+        (Z_error.transpose(-1, -2) @ S.pinverse()[..., None, :, :] @ Z_error).squeeze()
         # + torch.logdet(S)[..., None]
     )
     # this is the associtiation liklihood bit
@@ -283,7 +283,7 @@ def association_loglikelihood_distance(
         
     else:
         d += torch.logdet(S)[..., None]
-        d = d.detach()
+        d = d.detach().cpu()
     
     d = d.min(axis=-1)[0].numpy()
 
@@ -305,81 +305,81 @@ def association_loglikelihood_distance(
     )
 
 
-def mahalanobis_distance(
-    df: pl.DataFrame,
-    cutoff: float = None,
-    gpu: bool = True,
-    pos_override=None,
-    return_maha: bool = False,
-) -> pl.DataFrame:
-    device = torch.device("cuda" if gpu else "cpu")
+# def mahalanobis_distance(
+#     df: pl.DataFrame,
+#     cutoff: float = None,
+#     gpu: bool = True,
+#     pos_override=None,
+#     return_maha: bool = False,
+# ) -> pl.DataFrame:
+#     device = torch.device("cuda" if gpu else "cpu")
 
-    H = build_h_matrix().to(device)
+#     H = build_h_matrix().to(device)
 
-    R = build_r_matrix().to(device)
+#     R = build_r_matrix().to(device)
 
-    P_follower = torch.from_numpy(
-        df["P"]
-        .to_numpy()
-        .copy()
-        .reshape(-1, 6, 6)
-        .astype(
-            dtype=np.float32,
-        )
-    ).to(device)
+#     P_follower = torch.from_numpy(
+#         df["P"]
+#         .to_numpy()
+#         .copy()
+#         .reshape(-1, 6, 6)
+#         .astype(
+#             dtype=np.float32,
+#         )
+#     ).to(device)
 
-    P_leader = torch.from_numpy(
-        df["P_leader"]
-        .to_numpy()
-        .copy()
-        .reshape(-1, 6, 6)
-        .astype(
-            dtype=np.float32,
-        )
-    ).to(device)
+#     P_leader = torch.from_numpy(
+#         df["P_leader"]
+#         .to_numpy()
+#         .copy()
+#         .reshape(-1, 6, 6)
+#         .astype(
+#             dtype=np.float32,
+#         )
+#     ).to(device)
 
-    S_leader = H @ P_leader @ H.T + R
-    S_follower = H @ P_follower @ H.T + R
+#     S_leader = H @ P_leader @ H.T + R
+#     S_follower = H @ P_follower @ H.T + R
 
-    S = S_leader + S_follower
+#     S = S_leader + S_follower
 
-    Z_followers = []
-    Z_leaders = []
+#     Z_followers = []
+#     Z_leaders = []
 
-    create_z_matrices(df, Z_followers, Z_leaders, pos_override=pos_override)
+#     create_z_matrices(df, Z_followers, Z_leaders, pos_override=pos_override)
 
-    Z_followers = torch.stack(Z_followers, dim=1).to(device)
-    Z_leaders = torch.stack(Z_leaders, dim=1).to(device)
-    Z_error = Z_followers - Z_leaders
+#     Z_followers = torch.stack(Z_followers, dim=1).to(device)
+#     Z_leaders = torch.stack(Z_leaders, dim=1).to(device)
+#     Z_error = Z_followers - Z_leaders
 
-    # calculate the mahalanobis distance
-    m_sq = (
-        Z_error.transpose(-1, -2)
-        @ torch.linalg.pinv(
-            S,
-        )[..., None, :, :]
-        @ Z_error
-    ).squeeze()
+#     # calculate the mahalanobis distance
+#     m_sq = (
+#         Z_error.transpose(-1, -2)
+#         @ torch.linalg.pinv(
+#             S,
+#         )[..., None, :, :]
+#         @ Z_error
+#     ).squeeze()
 
-    if return_maha:
-        return df.with_columns(
-            [
-                pl.Series(m_sq.detach().cpu().numpy()).alias("m_sq"),
-            ]
-        )
+#     if return_maha:
+#         return df.with_columns(
+#             [
+#                 pl.Series(m_sq.detach().cpu().numpy()).alias("m_sq"),
+#             ]
+#         )
 
-    assert cutoff is not None, "Must provide a cutoff"
+#     assert cutoff is not None, "Must provide a cutoff"
 
-    # find which is inside the gate
-    inside_gate_1 = m_sq < cutoff
+#     # find which is inside the gate
+#     inside_gate_1 = m_sq < cutoff
 
-    inside_gate = (inside_gate_1).any(-1)
+#     inside_gate = (inside_gate_1).any(-1)
 
-    return df.with_columns(
-        [
-            pl.Series(inside_gate.detach().cpu().numpy()).alias("inside_gate"),
-        ]
-    )
+#     return df.with_columns(
+#         [
+#             pl.Series(inside_gate.detach().cpu().numpy()).alias("inside_gate"),
+#         ]
+#     )
 
 
 class IMF:

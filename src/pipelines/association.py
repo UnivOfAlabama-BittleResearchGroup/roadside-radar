@@ -353,106 +353,52 @@ def calc_assoc_liklihood_distance(
 @lazify
 def calculate_match_indexes(
     df: pl.DataFrame,
-    match_time_threshold: float = 1,
     min_time_threshold: float = 0.5,
 ) -> pl.DataFrame:
     return (
-        df.lazy()
+        df
+        .lazy()
         .with_columns(
-            # sort the object id and leader
             pl.when(pl.col("leader") < pl.col("object_id"))
             .then(pl.concat_list([pl.col("leader"), pl.col("object_id")]))
             .otherwise(pl.concat_list([pl.col("object_id"), pl.col("leader")]))
-            # pl.struct(
-            #     [
-            #         pl.col("leader"),
-            #         pl.col("object_id"),
-            #     ]
-            # )
-            # # .hash()
             .alias("pair")
         )
-        .with_columns(
-            (pl.col("prediction") | pl.col("prediction_leader")).alias(
-                "prediction_any"
-            ),
-            (
-                (pl.col("epoch_time") - pl.col("epoch_time").min()).dt.milliseconds()
-                / 1e3
-            )
-            .over("pair")
-            .alias("match_time"),
-        )
-        # .with_columns(pl.col("match_time"))
-        .filter(
-            (
-                (~pl.col("prediction_any"))
-                | (pl.col("match_time") < min_time_threshold)
-                # & pl.col("match_time") <
-            )
-        )
-        # .sort(["match_time"])
+        # .with_columns(
+        #     (pl.col("prediction") | pl.col("prediction_leader")).alias(
+        #         "prediction_any"
+        #     ),
+        #     (pl.col('pair').cum_count() / 10)  # simpler way to get the "match time"
+        #     .over("pair")
+        #     .alias("match_time"),
+        # )
+        # .filter(
+        #     (
+        #         (~pl.col("prediction_any"))
+        #         | (pl.col("match_time") < min_time_threshold)
+        #     )
+        # )
         .with_columns(
             [
                 # ----------- Calculate the Time Headway ------------
                 ((pl.col("s_leader") - pl.col("s")) / pl.col("s_velocity")).alias(
                     "headway"
                 ),
-                # -------- Calculate the Match Indexes Take 2 ------------
-                # Find periods where there is no prediction
-                # prediction naturally has more uncertainty
-                # ---------------------------
-                # find the start index to take
-                pl.col("object_id").cumcount().over("pair").alias("sort_index"),
-                # find the end index to use
+
+                # pl.col("object_id").cumcount().over("pair").alias("sort_index"),
+            
             ]
         )
-        # .with_columns(
-        #     pl.when(pl.col("prediction_any"))
-        #     .then(pl.col("sort_index").max())
-        #     .otherwise(pl.col("sort_index"))
-        #     .over("pair")
-        #     .alias("sort_index"),
+        # .sort(
+        #     ["epoch_time"],
         # )
-        .sort(
-            ["epoch_time"],
-        )
     )
-
-
-# @timeit
-# @lazify
-# def pipe_gate_headway_calc(
-#     df: pl.DataFrame,
-#     alpha: float = 0.1,
-#     window: int = 20,
-# ) -> pl.DataFrame:
-#     return df.group_by(
-#         "pair",
-#     ).agg(
-#         pl.col("association_distance")
-#         .rolling_mean(window_size=window, min_periods=1)
-#         # .median()
-#         # .quantile(0.5)
-#         .min()
-#         .alias("association_distance_filt"),
-#         pl.col("epoch_time").first().alias("epoch_time"),
-#         pl.col('epoch_time').last().alias('epoch_time_max'),
-
-#         pl.col("prediction").any().alias("prediction"),
-#         pl.col("prediction_leader").any().alias("prediction_leader"),
-#         # pl.col("headway").ewm_mean(alpha=alpha).mean().alias("headway"),
-#         pl.col("headway").mean().alias("headway"),
-#         pl.col("s_leader").first().alias("leader_s"),
-#         pl.col("s").first().alias("s"),
-#     )
 
 
 @timeit
 @lazify
 def pipe_gate_headway_calc(
     df: pl.DataFrame,
-    alpha: float = 0.1,
     window: int = 20,
     association_dist_cutoff: float = chi2.ppf(0.95, 4),
 ) -> pl.DataFrame:
