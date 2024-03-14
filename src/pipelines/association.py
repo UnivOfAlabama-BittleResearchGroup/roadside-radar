@@ -7,6 +7,7 @@ from src.filters.fusion import association_loglikelihood_distance
 from src.pipelines.utils import lazify, timeit
 from scipy.stats import chi2
 import networkx as nx
+import heapq
 
 
 @lazify
@@ -356,8 +357,7 @@ def calculate_match_indexes(
     min_time_threshold: float = 0.5,
 ) -> pl.DataFrame:
     return (
-        df
-        .lazy()
+        df.lazy()
         .with_columns(
             pl.when(pl.col("leader") < pl.col("object_id"))
             .then(pl.concat_list([pl.col("leader"), pl.col("object_id")]))
@@ -384,9 +384,7 @@ def calculate_match_indexes(
                 ((pl.col("s_leader") - pl.col("s")) / pl.col("s_velocity")).alias(
                     "headway"
                 ),
-
                 # pl.col("object_id").cumcount().over("pair").alias("sort_index"),
-            
             ]
         )
         # .sort(
@@ -759,6 +757,8 @@ def get_graph_score(
     df: pl.DataFrame,
     remove_edges: List[int] = (),
     add_edges: List[int] = (),
+    reinstate_graph: bool = True,
+    # combs: List[str] = None,
 ) -> float:
     for remove in remove_edges:
         sub_graph.remove_edge(*remove)
@@ -769,6 +769,7 @@ def get_graph_score(
     # return score
     scores = []
     for subgraph in nx.connected_components(sub_graph):
+        # get the combinations that would come from a fully-connected graph
         combs = [
             f"{start}-{end}" if start < end else f"{end}-{start}"
             for start, end in combinations(subgraph, 2)
@@ -781,7 +782,20 @@ def get_graph_score(
         if score is not None:
             scores.append(score)
 
+    if reinstate_graph:
+        for remove in remove_edges:
+            sub_graph.add_edge(*remove)
+
+        for add_edge in add_edges:
+            sub_graph.remove_edge(*add_edge)
+
     return scores
+
+
+# def check_improvement(old_score, new_score, cutoff):
+
+#     # check that there is improvement over the last score
+#     return any(s < cutoff for s in new_score) and np.mean(new_score) < np.mean(old_score)
 
 
 def walk_graph_removals(
@@ -794,26 +808,37 @@ def walk_graph_removals(
     remove_edges = []
     graph_scores = []
 
+    # sort the edges by their node connectivity
+    edges = list(sorted(g.edges, key=lambda x: g.degree(x[0]) + g.degree(x[1])))
+
     while i == 0 or (
         (i < max_removals) and not all(s < cutoff for s in graph_scores[-1])
     ):
         # for _ in range(max_removals):
         scores = []
-        for edge in g.edges:
+        for edge in edges:
             score = get_graph_score(
                 # score_func,
-                g.copy(),
+                g,
                 df,
                 remove_edges=[edge],
             )
             # score = np.mean([s for s in score if s is not None])
-            scores.append((score, edge))
+            # scores.append((score, edge))
+            heapq.heappush(scores, (sum(score) / (len(score) or 1), score, edge))
 
-        # store the scores
-        scores = sorted(scores, key=lambda x: np.mean(x[0]))
-        remove_edges.append(scores[0][1])
-        graph_scores.append(scores[0][0])
-        g.remove_edge(*scores[0][1])
+        # # store the scores
+        # # keep any that reduce the score underneath the cutoff
+        # scores = sorted(scores, key=lambda x: np.mean(x[0]))
+        opt_edge = heapq.heappop(scores)
+
+        # check the score
+        remove_edges.append(opt_edge[-1])
+        graph_scores.append(opt_edge[1])
+
+        # remove what we don't need
+        g.remove_edge(*opt_edge[-1])
+        edges.remove(opt_edge[-1])
 
         i += 1
 
@@ -822,7 +847,7 @@ def walk_graph_removals(
     # delete_edges = remove_edges.copy()
     pop_edges = []
     for i, edge in enumerate(remove_edges):
-        score = get_graph_score(g.copy(), df, add_edges=[edge])
+        score = get_graph_score(g, df, add_edges=[edge])
 
         if all(s < cutoff for s in score):
             pop_edges.append(i)
