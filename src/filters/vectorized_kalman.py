@@ -26,9 +26,7 @@ def build_h_matrix() -> FloatTensor:
         np.array(
             [
                 [1, 0, 0, 0, 0, 0],
-                # [0, 0, 0, 0, 0, 0],
                 [0, 0, 0, 1, 0, 0],
-                # [0, 0, 0, 0, 0, 0],
             ]
         ),
     )
@@ -1018,7 +1016,7 @@ class IMMFilter:
             #     S,
             #     # hermitian=True,
             # )
-            SI = S.inverse()
+            SI = S.pinverse()
         except RuntimeError as e:
             print(f"pinverse failed at time {t_ind}")
             raise e
