@@ -577,6 +577,42 @@ def build_match_df(
 
 @timeit
 @lazify
+def make_graph_based_ids(df: pl.DataFrame, graph: nx.Graph, return_cc_list: bool = False) -> pl.DataFrame:
+    cc = list(nx.connected_components(graph))
+
+    cc_df = pl.DataFrame(
+        data=[(int(_x), i) for i, x in enumerate(cc) for _x in x],
+        schema={
+            "object_id": pl.UInt32,
+            "vehicle_id": pl.UInt64,
+        },
+    )
+
+    cc_df = cc_df.vstack(
+        df.lazy()
+        .select(pl.col("object_id").unique().cast(pl.UInt32))
+        .with_context(cc_df.rename({"object_id": "object_id_left"}).lazy())
+        .filter(~pl.col("object_id").is_in(pl.col("object_id_left")))
+        .with_row_count(
+            "vehicle_id",
+            offset=cc_df["vehicle_id"][-1] + 1,
+        )
+        .cast({"vehicle_id": pl.UInt64})
+        .select(["object_id", "vehicle_id"])
+        .collect()
+    )
+
+    df = df.with_columns(pl.col("object_id").cast(pl.UInt32)).join(
+        cc_df, on="object_id", how="left"
+    )
+
+    if return_cc_list:
+        return df, cc
+    return df
+
+
+@timeit
+@lazify
 def create_vehicle_ids(
     df: pl.DataFrame,
     match_df: pl.DataFrame,
@@ -586,44 +622,17 @@ def create_vehicle_ids(
     g = nx.Graph()
 
     # create a bidirectional graph of connections, with the weight being the time difference
-
     for d in match_df.select(
         ["object_id", "leader", "association_distance_filt"]
     ).to_dicts():
         g.add_edge(d["object_id"], d["leader"], weight=d["association_distance_filt"])
 
-    # return
-    # get all the connected components
-    cc = list(nx.connected_components(g))
-    # create a dataframe of the connected components
-    cc_df = pl.DataFrame(
-        {
-            "object_id": [int(_x) for x in cc for _x in x],
-            "vehicle_id": [i for i, x in enumerate(cc) for _ in x],
-        },
-        schema={
-            "object_id": pl.UInt32,
-            "vehicle_id": pl.UInt64,
-        },
-    )
-
-    cc_df = cc_df.vstack(
-        df.select(pl.col("object_id").unique().cast(pl.UInt32))
-        .filter(~pl.col("object_id").is_in(cc_df["object_id"]))
-        .with_row_count(
-            "vehicle_id",
-            offset=cc_df["vehicle_id"][-1] + 1,
-        )
-        .cast({"vehicle_id": pl.UInt64})
-        .select(["object_id", "vehicle_id"])
-    )
-
+    # make the ids
+    df, cc = make_graph_based_ids(df, graph=g, return_cc_list=True)
     return (
         cc,
         g,
-        df.with_columns(pl.col("object_id").cast(pl.UInt32)).join(
-            cc_df, on="object_id", how="left"
-        ),
+        df
     )
 
 
