@@ -26,7 +26,9 @@ def build_h_matrix() -> FloatTensor:
         np.array(
             [
                 [1, 0, 0, 0, 0, 0],
+                [0, 1, 0, 0, 0, 0],
                 [0, 0, 0, 1, 0, 0],
+                [0, 0, 0, 0, 1, 0],
             ]
         ),
     )
@@ -44,13 +46,12 @@ def build_r_matrix(pos_error: float = 0.5, d_pos_error: float = 0.5) -> FloatTen
     )
 
     return torch.Tensor(
-        np.array(
+        np.diag(
             [
-                [
-                    pos_error + discretization_error,
-                    0,
-                ],
-                [0, d_pos_error + discretization_error],
+                pos_error + discretization_error,
+                1,
+                d_pos_error + discretization_error,
+                1,
             ]
         )
         ** 2,
@@ -101,12 +102,12 @@ def pick_device(gpu: bool = True) -> torch.device:
 
 class _VectorizedKalmanFilter:
     x_dim = 6
-    z_dim = 2
+    z_dim = 4
 
     P_mod = 1
 
-    w_s = np.sqrt(4)
-    w_d = np.sqrt(0.1)
+    w_s = np.sqrt(2)
+    w_d = np.sqrt(0.5)
 
     stop_speed_threshold = 0.5
 
@@ -179,9 +180,9 @@ class _VectorizedKalmanFilter:
             ).to(self._device)
         else:
             # this is for IMM filter, where predict_mask can be shared across filters
-            self._predict_mask: TensorType[
-                "time", "vehicle", "x_dim"
-            ] = predict_mask.to(self._device)
+            self._predict_mask: TensorType["time", "vehicle", "x_dim"] = (
+                predict_mask.to(self._device)
+            )
 
         # save the time differences
         if dt is None:
@@ -279,8 +280,8 @@ class _VectorizedKalmanFilter:
         return self.Q_static(
             self._dt[t_ind],
             (self.v_dim, self.x_dim, self.x_dim),
-            self._z[t_ind, :, 0],  # speed info
-            self._predict_mask[t_ind],
+            self._z[t_ind, :, 1],  # speed info
+            mask=self._predict_mask[t_ind],
         ).to(self.device)
 
     @property
@@ -476,6 +477,11 @@ class _VectorizedKalmanFilter:
         if device is None:
             device = Xs.device
 
+        Ps = torch.clamp(
+            Ps,
+            min=1e-9,
+        )
+
         # smoother gain
         out_Xs = Xs.unsqueeze(-1).clone()
         for k in tqdm(range(n - 2, -1, -1)):
@@ -493,11 +499,7 @@ class _VectorizedKalmanFilter:
             # replace pinv with torch.linalg.lstsq(A, B).solution
             # K = torch.linalg.lstsq(Ps[k, mask] @ F_last.transpose(-1, -2), torch.eye(dim_x, device=device)).solution
 
-            K = (
-                Ps[k, mask]
-                @ F_last.transpose(-1, -2)
-                @ Pp.inverse()
-            )
+            K = Ps[k, mask] @ F_last.transpose(-1, -2) @ Pp.pinverse()
 
             out_Xs[k, mask] += K @ (out_Xs[k + 1, mask] - F_last @ out_Xs[k, mask])
             Ps[k, mask] += K @ (Ps[k + 1, mask] - Pp) @ K.transpose(-1, -2)
@@ -568,11 +570,11 @@ class CALKFilter(_VectorizedKalmanFilter):
             cls.w_d,
         )
 
-        # zero out the d_dot and dd_dot terms
-        Q[..., 4, :] = 0
-        Q[..., 5, :] = 0
-        Q[..., :, 4] = 0
-        Q[..., :, 5] = 0
+        # # zero out the d_dot and dd_dot terms
+        # Q[..., 4, :] = 0
+        # Q[..., 5, :] = 0
+        # Q[..., :, 4] = 0
+        # Q[..., :, 5] = 0
 
         return Q
 
@@ -673,15 +675,15 @@ class CVLKFilter(_VectorizedKalmanFilter):
             cls.w_d,
         )
 
-        # zero out the d_dot and dd_dot terms
-        Q[..., 2, :] = 0  # no acceleration
-        Q[..., :, 2] = 0  # no acceleration
+        # # zero out the d_dot and dd_dot terms
+        # Q[..., 2, :] = 0  # no acceleration
+        # Q[..., :, 2] = 0  # no acceleration
 
-        Q[..., 4, :] = 0
-        Q[..., 5, :] = 0
-        Q[..., :, 4] = 0
-        Q[..., :, 5] = 0
-        return Q @ Q.transpose(-1, -2)
+        # Q[..., 4, :] = 0
+        # Q[..., 5, :] = 0
+        # Q[..., :, 4] = 0
+        # Q[..., :, 5] = 0
+        return Q
 
 
 class CALCFilter(_VectorizedKalmanFilter):
@@ -852,11 +854,11 @@ class IMMFilter:
             dtype=torch.bool,
         )
 
-        self._predict_mask[
-            self._filters[0].inds[:, 0], self._filters[0].inds[:, 1]
-        ] = torch.BoolTensor(
-            df["prediction"].to_numpy(writable=True).astype(np.bool_),
-        ).to(self._device)
+        self._predict_mask[self._filters[0].inds[:, 0], self._filters[0].inds[:, 1]] = (
+            torch.BoolTensor(
+                df["prediction"].to_numpy(writable=True).astype(np.bool_),
+            ).to(self._device)
+        )
 
         self._compute_state_estimate(0)
 
@@ -972,9 +974,9 @@ class IMMFilter:
             *self.update_vectorized(t_ind)
         ).exp()
 
-        likelihoods[
-            likelihoods <= torch.finfo(likelihoods.dtype).min
-        ] = torch.finfo().min
+        likelihoods[likelihoods <= torch.finfo(likelihoods.dtype).min] = (
+            torch.finfo().min
+        )
 
         # update the mode probabilities. This is the spot! where they get updated
         # so have to use the last time step

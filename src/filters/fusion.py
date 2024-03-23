@@ -90,37 +90,46 @@ def build_r_matrix(
     IDK why this is a function, but it is. ChatGPT made me do it
     """
     if dims == 6:
-        return torch.FloatTensor(
-            np.diag(
-                [
-                    pos_error,
-                    1,
-                    1,
-                    d_pos_error,
-                    1,
-                    1,
-                ]
-            ),
+        return (
+            torch.FloatTensor(
+                np.diag(
+                    [
+                        pos_error,
+                        1,
+                        1,
+                        d_pos_error,
+                        1,
+                        1,
+                    ]
+                ),
+            )
+            ** 2
         )
     elif dims == 4:
-        return torch.FloatTensor(
-            np.diag(
-                [
-                    pos_error,
-                    1,
-                    d_pos_error,
-                    1,
-                ]
-            ),
+        return (
+            torch.FloatTensor(
+                np.diag(
+                    [
+                        pos_error,
+                        1,
+                        d_pos_error,
+                        1,
+                    ]
+                ),
+            )
+            ** 2
         )
     elif dims == 2:
-        return torch.FloatTensor(
-            np.diag(
-                [
-                    pos_error,
-                    d_pos_error,
-                ]
-            ),
+        return (
+            torch.FloatTensor(
+                np.diag(
+                    [
+                        pos_error,
+                        d_pos_error,
+                    ]
+                ),
+            )
+            ** 2
         )
 
 
@@ -178,7 +187,7 @@ def loglikelihood(
 
     H = build_h_matrix().to(torch.float32).to(device)
 
-    R = build_r_matrix(pos_error=2.5, d_pos_error=1).to(torch.float32).to(device)
+    R = build_r_matrix(pos_error=2.5, d_pos_error=1.5).to(torch.float32).to(device)
 
     P_leader = torch.from_numpy(
         df["P_leader"]
@@ -233,7 +242,7 @@ def association_loglikelihood_distance(
     device = pick_device(gpu)
 
     H = build_h_matrix(dims=dims).to(device)
-    R = build_r_matrix(d_pos_error=1.38, pos_error=2, dims=dims).to(device)
+    R = build_r_matrix(d_pos_error=1.5, pos_error=2.5, dims=dims).to(device)
     # R = build_r_matrix().to(device)
 
     P = torch.from_numpy(
@@ -279,12 +288,16 @@ def association_loglikelihood_distance(
     )
     # this is the associtiation liklihood bit
     if device.type == "mps":
+        # d += torch.logdet(S.cpu())[..., None]
         d = d.detach().cpu() + torch.logdet(S.cpu())[..., None]
-        
+
     else:
         d += torch.logdet(S)[..., None]
         d = d.detach().cpu()
-    
+
+    # check 2d intersection of the measurements
+    # overlap =
+
     d = d.min(axis=-1)[0].numpy()
 
     # zero out all local tensors
@@ -649,37 +662,47 @@ class ImprovedFastCI(IMF):
         # CALCFilter.w_s = 2
         # CALCFilter.w_d = 1
 
-        # R = build_r_matrix(pos_error=0.5, d_pos_error=0.5).to(self.device)
-        # H = build_h_matrix().to(self.device)
+        R = build_r_matrix(pos_error=2.5, d_pos_error=1, dims=2).to(self.device)
+        H = build_h_matrix(dims=2).to(self.device)
 
-        # # # scale R to a x,dim x dim matrix
-        # P_mod = (
-        #     H.T @ R @ H
-        # )  # / 10 #+ CALCFilter.P_mod * torch.eye(self.x_dim).to(self.device)
+        # # # # # scale R to a x,dim x dim matrix
+        P_mod = (
+            H.T @ R @ H
+        )  # / 10 #+ CALCFilter.P_mod * torch.eye(self.x_dim).to(self.device)
 
-        # self.P[:, ...]  = P_mod.clone() #+ CALCFilter.P_mod * torch.eye(self.x_dim).to(self.device)
+        # self.P[:, ...]  += P_mod.clone() #+ CALCFilter.P_mod * torch.eye(self.x_dim).to(self.device)
         # self.P_hat[0, ...] = P_mod
         # # self.P = torch.clamp(self.P, min=0, max=15)
         # self.P_hat = torch.clamp(self.P_hat, min=0, max=1)
+        self.P = torch.clamp(
+            self.P,
+            min=1e-9,
+        )
+
+        # where are there more than 1 measurement? When this happens, we augment the uncertainty
+        # P_slicer = ((self.X.abs().sum(axis=-1) > 0).sum(axis=2) > 1)
+        # self.P[P_slicer] += P_mod
+
         for t in tqdm(range(1, self.t_dim)):
             x_t = self.X[t]
-            # clamp the P matrix to be positive definite
-            self.P[t, ...] = torch.clamp(
-                self.P[t, ...],
-                min=1e-9,
-            )
-            p_t = self.P[t]  # + P_mod
+            p_t = self.P[t]
 
             F = CALCFilter.F_static(
                 dt_vect=self.Dt[t, :, 0],
                 shape=(self.v_dim, self.x_dim, self.x_dim),
             ).to(self.device)
 
+            Q = CALCFilter.Q_static(
+                dt_vect=self.Dt[t, :, 0],
+                shape=(self.v_dim, self.x_dim, self.x_dim),
+            ).to(self.device)
+
             self.X_hat[t] = (F @ self.X_hat[t - 1,].unsqueeze(-1)).squeeze()
-            self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2)
+            self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2)   + Q
 
             for z in range(self.z_dim):
                 mask = x_t[:, z].abs().sum(axis=-1) > 0.1
+
 
                 I_i = torch.linalg.pinv(
                     p_t[mask, z],
@@ -723,13 +746,13 @@ class MeasurementCI(IMF):
                 shape=(self.v_dim, self.x_dim, self.x_dim),
             ).to(self.device)
 
-            Q = CALCFilter.Q_static(
-                dt_vect=self.Dt[t, :, 0],
-                shape=(self.v_dim, self.x_dim, self.x_dim),
-            ).to(self.device)
+            # Q = CALCFilter.Q_static(
+            #     dt_vect=self.Dt[t, :, 0],
+            #     shape=(self.v_dim, self.x_dim, self.x_dim),
+            # ).to(self.device)
 
             self.X_hat[t] = (F @ self.X_hat[t - 1,].unsqueeze(-1)).squeeze()
-            self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2) + Q
+            self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2)  # + Q
 
             omega = torch.tensor(0.5).to(self.device)
 
@@ -1010,7 +1033,7 @@ def _inner_rts(
         )
     )
 
-    # CALCFilter.w_s = 4
+    # CALCFilter.w_s = 1
     # CALCFilter.w_d = 2
 
     t_dim = chunk_df["time_index"].max() + 1

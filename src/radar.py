@@ -98,17 +98,18 @@ class BasicRadar:
                     ],
                 )
                 .hash()
-                .alias("hashed_object_id"),
+                .alias("object_id"),
             ]
         )
 
-        return df.join(
-            df.select(pl.col("hashed_object_id").unique()).with_row_count(
-                name="object_id"
-            ),
-            on="hashed_object_id",
-            how="left",
-        ).drop(["hashed_object_id"])
+        # return df.join(
+        #     df.select(pl.col("hashed_object_id").unique()).with_row_count(
+        #         name="object_id"
+        #     ),
+        #     on="hashed_object_id",
+        #     how="left",
+        # ).drop(["hashed_object_id"])
+        return df
 
     @classmethod
     @timeit

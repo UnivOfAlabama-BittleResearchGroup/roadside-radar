@@ -521,20 +521,22 @@ def build_match_df(
 
 @timeit
 @lazify
-def make_graph_based_ids(df: pl.DataFrame, graph: nx.Graph, return_cc_list: bool = False) -> pl.DataFrame:
+def make_graph_based_ids(
+    df: pl.DataFrame, graph: nx.Graph, return_cc_list: bool = False
+) -> pl.DataFrame:
     cc = list(nx.connected_components(graph))
 
     cc_df = pl.DataFrame(
         data=[(int(_x), i) for i, x in enumerate(cc) for _x in x],
         schema={
-            "object_id": pl.UInt32,
+            "object_id": pl.UInt64,
             "vehicle_id": pl.UInt64,
         },
     )
 
     cc_df = cc_df.vstack(
         df.lazy()
-        .select(pl.col("object_id").unique().cast(pl.UInt32))
+        .select(pl.col("object_id").unique().cast(pl.UInt64))
         .with_context(cc_df.rename({"object_id": "object_id_left"}).lazy())
         .filter(~pl.col("object_id").is_in(pl.col("object_id_left")))
         .with_row_count(
@@ -546,7 +548,7 @@ def make_graph_based_ids(df: pl.DataFrame, graph: nx.Graph, return_cc_list: bool
         .collect()
     )
 
-    df = df.with_columns(pl.col("object_id").cast(pl.UInt32)).join(
+    df = df.with_columns(pl.col("object_id").cast(pl.UInt64)).join(
         cc_df, on="object_id", how="left"
     )
 
@@ -573,11 +575,7 @@ def create_vehicle_ids(
 
     # make the ids
     df, cc = make_graph_based_ids(df, graph=g, return_cc_list=True)
-    return (
-        cc,
-        g,
-        df
-    )
+    return (cc, g, df)
 
 
 @timeit
@@ -609,7 +607,7 @@ def build_fusion_df(
             .over("vehicle_id"),
         )
         # filter out the first second of measurements if the count > 0
-        .filter((pl.col("cumcount") < 1) | (pl.col("cumtime") > 15))
+        # .filter((pl.col("cumcount") < 1) | (pl.col("cumtime") > 15))
         .collect()
         .lazy()
         # # .drop(["cumtime", "cumcount", "count"])
@@ -632,7 +630,7 @@ def build_fusion_df(
         # )
         .filter(
             ~(
-                (pl.col("count") == 1)
+                (pl.col("all_pred"))
                 & pl.col("prediction")
                 & (pl.col("timedelta") < prediction_length * 1e3)
             )
@@ -761,12 +759,20 @@ def filter_bad_lane_matches(
     )
 
 
+def get_edge_attributes(G, name, cutoff):
+    # ...
+    edges = G.edges(data=True)
+    return (x[-1][name] or (cutoff - 1e-3) for x in edges)
+
+
 def get_graph_score(
     sub_graph: nx.Graph,
-    df: pl.DataFrame,
+    # df: pl.DataFrame,
     remove_edges: List[int] = (),
     add_edges: List[int] = (),
     reinstate_graph: bool = True,
+    big_G: nx.Graph = None,
+    cutoff: float = None,
     # combs: List[str] = None,
 ) -> float:
     for remove in remove_edges:
@@ -778,18 +784,11 @@ def get_graph_score(
     # return score
     scores = []
     for subgraph in nx.connected_components(sub_graph):
-        # get the combinations that would come from a fully-connected graph
-        combs = [
-            f"{start}-{end}" if start < end else f"{end}-{start}"
-            for start, end in combinations(subgraph, 2)
-        ]
-
-        score = df.filter(pl.col("pair_str").is_in(combs))[
-            "association_distance_filt"
-        ].mean()
-
-        if score is not None:
-            scores.append(score)
+        sg = big_G.subgraph(subgraph)
+        try:
+            scores.extend(get_edge_attributes(sg, "weight", cutoff))
+        except TypeError:
+            scores.append(cutoff - 0.0001)
 
     if reinstate_graph:
         for remove in remove_edges:
@@ -805,21 +804,38 @@ def get_graph_score(
 
 #     # check that there is improvement over the last score
 #     return any(s < cutoff for s in new_score) and np.mean(new_score) < np.mean(old_score)
+from itertools import chain, combinations
+
+
+def powerset(iterable):
+    "powerset([1,2,3]) --> () (1,) (2,) (3,) (1,2) (1,3) (2,3) (1,2,3)"
+    s = list(iterable)  # allows duplicate elements
+    return chain.from_iterable(combinations(s, r) for r in range(len(s) + 1, 0, -1))
 
 
 def walk_graph_removals(
     g: nx.Graph,
     cutoff: float = chi2.ppf(0.95, 4),
     max_removals: int = 3,
-    df: pl.DataFrame = None,
+    big_G: nx.Graph = None,
 ):
     i = 0
     remove_edges = []
-    graph_scores = []
+    graph_scores = get_graph_score(
+        g,
+        big_G=big_G,
+        cutoff=cutoff,
+    )
+
+    if all(s < cutoff for s in graph_scores):
+        return []
+    
+    fresh_g = g.copy()
 
     # sort the edges by their node connectivity
     edges = list(sorted(g.edges, key=lambda x: g.degree(x[0]) + g.degree(x[1])))
-
+    graph_scores = []
+    
     while i == 0 or (
         (i < max_removals) and not all(s < cutoff for s in graph_scores[-1])
     ):
@@ -829,8 +845,9 @@ def walk_graph_removals(
             score = get_graph_score(
                 # score_func,
                 g,
-                df,
                 remove_edges=[edge],
+                big_G=big_G,
+                cutoff=cutoff,
             )
             # score = np.mean([s for s in score if s is not None])
             # scores.append((score, edge))
@@ -855,34 +872,20 @@ def walk_graph_removals(
     # This happends for multiple reasons
     # delete_edges = remove_edges.copy()
     pop_edges = []
+    # all_valid_edges = set(fresh_g)
     for i, edge in enumerate(remove_edges):
-        score = get_graph_score(g, df, add_edges=[edge])
+        # edge = list(set(edge).union(all_valid_edges))
+        # if not len(edge):
+        #     continue
+        score = get_graph_score(g, add_edges=[edge], big_G=big_G, cutoff=cutoff)
 
         if all(s < cutoff for s in score):
+            # print("adding_back", edge)
             pop_edges.append(i)
             g.add_edge(*edge)
+            # for e in edge:
+            # g.add_edge(*e)
 
-    # graph_scores
-    remove_edges = [
-        remove_edges[i] for i in range(len(remove_edges)) if i not in pop_edges
-    ]
-    graph_scores = [
-        graph_scores[i] for i in range(len(graph_scores)) if i not in pop_edges
-    ]
+    remove_edges = list(nx.difference(fresh_g, g).edges)
 
-    return pl.DataFrame(
-        {
-            "remove_edges": remove_edges,
-            "graph_scores": graph_scores,
-            "vehicle_index": [
-                df["vehicle_index"][0],
-            ]
-            * len(remove_edges),
-        }
-    )
-
-    # return remove_edges, graph_scores
-
-
-# parallelize the graph walking
-# def walk_graph_removals_d()
+    return remove_edges

@@ -197,7 +197,7 @@ class Lane:
                 }),
                 right_on="s",
                 left_on=s_col,
-                tolerance=self._step_size,
+                tolerance=self._step_size * 2,
                 suffix="_lane",
             )
         )

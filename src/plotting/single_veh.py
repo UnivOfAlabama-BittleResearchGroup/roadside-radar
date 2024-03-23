@@ -4,6 +4,7 @@ from plotly.subplots import make_subplots
 import networkx as nx
 import matplotlib.pyplot as plt
 
+
 def plot_vehicle(
     veh_df: pl.DataFrame,
     s_col: str = "s",
@@ -65,32 +66,86 @@ def plot_vehicle(
     return fig
 
 
-def plot_graph(veh_id: int, sublist: list = None, subgraph: nx.Graph = None) -> None:
+def plot_graph(
+    vehicle_colors,
+    bad_edge_color,
+    subgraph: nx.Graph = None,
+    draw_nodes=False,
+    full_graph: nx.Graph = None,
+    ax=None,
+    i = 0
     
-    # # replace negative weights w/ abs value
-    # for u, v, d in subgraph.edges(data=True):
-    #     if d["weight"] < 0:
-    #         d["weight"] = abs(d["weight"])
+) -> None:
+    
+    vehicle_colors = vehicle_colors.copy()
 
-            # update the edge weight
+    if ax is None:
+        plt.figure(figsize=(10, 10))
+        ax = plt.gca()
+
+    node_color_mapper = [
+        (j, v, vehicle_colors[j])
+        for j, node_list
+        in enumerate(nx.connected_components(subgraph))
+        for v in node_list
+    ]
+
+    full_sub = nx.subgraph(full_graph, subgraph).copy()
+
+    # remove some of the full_subs if they aren't connected in the subgraph
+    for edge in full_sub.edges:
+        if not nx.has_path(subgraph, edge[0], edge[1]):
+            full_sub.remove_edge(edge[0], edge[1])
+
+    for e in subgraph.edges:
+        subgraph[e[0]][e[1]]['weight'] = full_sub[e[0]][e[1]]["weight"]
 
     pos = nx.spring_layout(
-        subgraph,
+        full_sub,
+        k=20
+        # weight="weight", iterations=200
     )  # positions for all nodes - seed for reproducibility
 
-    # nodes
-    nx.draw_networkx_nodes(subgraph, pos, node_size=10)
+    nx.draw_networkx_nodes(
+        full_sub, 
+        pos,
+        nodelist=[x[1] for x in node_color_mapper],
+        node_size=150, 
+        ax=ax,
+        node_color="#F4FAFC",
+        alpha=1,
+        linewidths=1.5,
+        edgecolors=[x[2] for x in node_color_mapper]
+    )
 
     # edges
-    nx.draw_networkx_edges(subgraph, pos, width=2)
-    # nx.draw_networkx_edges(
-    #     small_g, pos, edgelist=esmall, width=6, alpha=0.5, edge_color="b", style="dashed"
-    # )
+    nx.draw_networkx_edges(full_sub, pos, width=2, ax=ax, )
 
     # node labels
-    nx.draw_networkx_labels(subgraph, pos, font_size=5, font_family="sans-serif")
+    # if draw_nodes:
+    nx.draw_networkx_labels(
+        subgraph, 
+        pos,
+        labels={x[1]: x[0] for x in node_color_mapper},
+        font_size=10, 
+        font_family="sans-serif", 
+        ax=ax,
+    )
+
     # edge weight labels
-    edge_labels = nx.get_edge_attributes(subgraph, "weight")
+    edge_labels = nx.get_edge_attributes(subgraph, "weight",)
     # round the edge weights
     edge_labels = {k: round(v, 2) for k, v in edge_labels.items()}
-    nx.draw_networkx_edge_labels(subgraph, pos, edge_labels, font_size=5)
+    nx.draw_networkx_edge_labels(subgraph, pos, edge_labels, font_size=10, ax=ax)
+
+    # if bad_graph is not None:
+    bad_edges = nx.difference(full_sub, subgraph)
+    for u, v in bad_edges.edges:
+        bad_edges[u][v]["weight"] = full_sub[u][v]["weight"]
+
+    nx.draw_networkx_edges(bad_edges, pos, edge_color=bad_edge_color, ax=ax, width=2)
+    bad_labels = nx.get_edge_attributes(bad_edges, "weight")
+    bad_labels = {k: round(v, 2) for k, v in bad_labels.items()}
+    nx.draw_networkx_edge_labels(bad_edges, pos, bad_labels, font_size=10, ax=ax)
+
+    # plt.title(f"Vehicle {veh_id} Graph")

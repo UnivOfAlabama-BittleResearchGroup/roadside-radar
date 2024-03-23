@@ -307,6 +307,7 @@ def build_kalman_df(
     df: pl.DataFrame,
     minimum_data_points: int = 10,
     s_col: str = "s",
+    derive_s_vel: bool = False,
 ) -> pl.DataFrame:
     kalman_df = (
         df.lazy()
@@ -318,12 +319,12 @@ def build_kalman_df(
                 pl.concat_list(
                     [
                         pl.col(s_col),
-                        # pl.col("s_velocity"),
+                        pl.col("s_velocity"),
                         pl.col("d"),
-                        # pl.col("d_velocity"),
+                        pl.col("d_velocity"),
                     ]
                 )
-                .cast(pl.Array(width=2, inner=pl.Float32))
+                .cast(pl.Array(width=4, inner=pl.Float32))
                 .alias("measurement"),
                 pl.col("prediction"),
                 pl.col("missing_data"),
@@ -336,6 +337,13 @@ def build_kalman_df(
         )
         .filter(pl.col("max_time") > minimum_data_points)
     )
+
+    if derive_s_vel:
+        if s_col != 's':
+            print(f'Warning: s_dot might be noisy using {s_col}')
+        df = df.with_columns(
+            (pl.col(s_col).diff() / pl.col('time_diff')).reverse().rolling_mean(window_size=20).reverse().over('kalman_id').alias('s_velocity')
+        )
 
     vehicle_inds = (
         kalman_df.group_by("kalman_id")
