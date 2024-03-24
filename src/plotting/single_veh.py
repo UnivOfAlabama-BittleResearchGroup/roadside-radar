@@ -70,11 +70,9 @@ def plot_graph(
     vehicle_colors,
     bad_edge_color,
     subgraph: nx.Graph = None,
-    draw_nodes=False,
     full_graph: nx.Graph = None,
     ax=None,
-    i = 0
-    
+    node_num_map=None
 ) -> None:
     
     vehicle_colors = vehicle_colors.copy()
@@ -83,12 +81,17 @@ def plot_graph(
         plt.figure(figsize=(10, 10))
         ax = plt.gca()
 
-    node_color_mapper = [
-        (j, v, vehicle_colors[j])
+    def node_num_func(i, x):
+        return i if node_num_map is None else  node_num_map[x]
+
+
+    node_color_mapper = {
+        v: (node_num_func(i, v), v, vehicle_colors[j])
         for j, node_list
         in enumerate(nx.connected_components(subgraph))
-        for v in node_list
-    ]
+        for i, v in enumerate(node_list)
+    }
+
 
     full_sub = nx.subgraph(full_graph, subgraph).copy()
 
@@ -109,13 +112,13 @@ def plot_graph(
     nx.draw_networkx_nodes(
         full_sub, 
         pos,
-        nodelist=[x[1] for x in node_color_mapper],
+        nodelist=list(node_color_mapper.keys()),
         node_size=150, 
         ax=ax,
         node_color="#F4FAFC",
         alpha=1,
         linewidths=1.5,
-        edgecolors=[x[2] for x in node_color_mapper]
+        edgecolors=[x[2] for x in node_color_mapper.values()]
     )
 
     # edges
@@ -126,7 +129,7 @@ def plot_graph(
     nx.draw_networkx_labels(
         subgraph, 
         pos,
-        labels={x[1]: x[0] for x in node_color_mapper},
+        labels={x[1]: x[0] for x in node_color_mapper.values()},
         font_size=10, 
         font_family="sans-serif", 
         ax=ax,
@@ -147,5 +150,5 @@ def plot_graph(
     bad_labels = nx.get_edge_attributes(bad_edges, "weight")
     bad_labels = {k: round(v, 2) for k, v in bad_labels.items()}
     nx.draw_networkx_edge_labels(bad_edges, pos, bad_labels, font_size=10, ax=ax)
-
+    return {v: i for v, (i, *_) in node_color_mapper.items()}
     # plt.title(f"Vehicle {veh_id} Graph")

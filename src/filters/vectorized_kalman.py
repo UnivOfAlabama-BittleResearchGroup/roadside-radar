@@ -106,7 +106,7 @@ class _VectorizedKalmanFilter:
 
     P_mod = 1
 
-    w_s = np.sqrt(2)
+    w_s = np.sqrt(1)
     w_d = np.sqrt(0.5)
 
     stop_speed_threshold = 0.5
@@ -499,8 +499,14 @@ class _VectorizedKalmanFilter:
             # replace pinv with torch.linalg.lstsq(A, B).solution
             # K = torch.linalg.lstsq(Ps[k, mask] @ F_last.transpose(-1, -2), torch.eye(dim_x, device=device)).solution
 
-            K = Ps[k, mask] @ F_last.transpose(-1, -2) @ Pp.pinverse()
+            try:
+                K = Ps[k, mask] @ F_last.transpose(-1, -2) @ Pp.pinverse()
 
+            except RuntimeError as e:
+                if Pp.isnan().all():
+                    # end of the line for k
+                    K = Ps[k, mask] @ F_last.transpose(-1, -2)
+            
             out_Xs[k, mask] += K @ (out_Xs[k + 1, mask] - F_last @ out_Xs[k, mask])
             Ps[k, mask] += K @ (Ps[k + 1, mask] - Pp) @ K.transpose(-1, -2)
 

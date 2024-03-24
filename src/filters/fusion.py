@@ -81,7 +81,9 @@ def build_h_matrix(dims: int = 4) -> torch.FloatTensor:
 
 def build_r_matrix(
     pos_error: float = 1.5,
+    pos_velo_error: float = 1,
     d_pos_error: float = 1.5,
+    d_velo_error: float = 1,
     dims: int = 4,
 ) -> torch.FloatTensor:
     """
@@ -95,10 +97,10 @@ def build_r_matrix(
                 np.diag(
                     [
                         pos_error,
-                        1,
+                        pos_velo_error,
                         1,
                         d_pos_error,
-                        1,
+                        d_velo_error,
                         1,
                     ]
                 ),
@@ -111,9 +113,9 @@ def build_r_matrix(
                 np.diag(
                     [
                         pos_error,
-                        1,
+                        pos_velo_error,
                         d_pos_error,
-                        1,
+                        d_velo_error,
                     ]
                 ),
             )
@@ -435,7 +437,7 @@ class IMF:
         )
 
         P[t_index, v_index, z_index] = torch.from_numpy(
-            df["P"].to_numpy().copy().reshape(-1, 6, 6).astype(np.float32)
+            df["P_CALC"].to_numpy().copy().reshape(-1, 6, 6).astype(np.float32)
         )
 
         # adding additional process noise to the length of the vehicle
@@ -662,8 +664,10 @@ class ImprovedFastCI(IMF):
         # CALCFilter.w_s = 2
         # CALCFilter.w_d = 1
 
-        R = build_r_matrix(pos_error=2.5, d_pos_error=1, dims=2).to(self.device)
-        H = build_h_matrix(dims=2).to(self.device)
+        R = build_r_matrix(
+            pos_error=1, pos_velo_error=0, d_pos_error=0, d_velo_error=0, dims=4
+        ).to(self.device)
+        H = build_h_matrix(dims=4).to(self.device)
 
         # # # # # scale R to a x,dim x dim matrix
         P_mod = (
@@ -674,9 +678,12 @@ class ImprovedFastCI(IMF):
         # self.P_hat[0, ...] = P_mod
         # # self.P = torch.clamp(self.P, min=0, max=15)
         # self.P_hat = torch.clamp(self.P_hat, min=0, max=1)
-        self.P = torch.clamp(
-            self.P,
-            min=1e-9,
+        self.P = (
+            torch.clamp(
+                self.P,
+                min=1e-9,
+            )
+            # + P_mod
         )
 
         # where are there more than 1 measurement? When this happens, we augment the uncertainty
@@ -698,11 +705,10 @@ class ImprovedFastCI(IMF):
             ).to(self.device)
 
             self.X_hat[t] = (F @ self.X_hat[t - 1,].unsqueeze(-1)).squeeze()
-            self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2)   + Q
+            self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2)  + Q
 
             for z in range(self.z_dim):
                 mask = x_t[:, z].abs().sum(axis=-1) > 0.1
-
 
                 I_i = torch.linalg.pinv(
                     p_t[mask, z],

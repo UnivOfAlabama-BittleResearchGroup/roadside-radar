@@ -619,20 +619,12 @@ def build_fusion_df(
         .filter(
             ~pl.col("prediction")
             | (pl.col("count") == 1)
-            | (pl.col("all_pred") & (pl.col("count") > 1))
+            | (pl.col("all_pred") & (pl.col("cumcount") == 1))
         )
-        # .with_columns(
-        #     # count again after filtering
-        #     # cumcount=pl.col("epoch_time").count().over(["epoch_time", "vehicle_id"]),
-        # )
-        # .filter(
-        #     (~pl.col("prediction") | (pl.col("cumcount") > 1))
-        # )
         .filter(
             ~(
-                (pl.col("all_pred"))
-                & pl.col("prediction")
-                & (pl.col("timedelta") < prediction_length * 1e3)
+                (pl.col("all_pred") & (pl.col("timedelta") < prediction_length * 1e3))
+                
             )
         )
         .drop(["cumtime", "cumcount"])
