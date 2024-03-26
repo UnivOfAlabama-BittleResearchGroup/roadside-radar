@@ -607,7 +607,7 @@ def build_fusion_df(
             .over("vehicle_id"),
         )
         # filter out the first second of measurements if the count > 0
-        # .filter((pl.col("cumcount") < 1) | (pl.col("cumtime") > 15))
+        .filter((pl.col("cumcount") < 1) | (pl.col("cumtime") > 15))
         .collect()
         .lazy()
         # # .drop(["cumtime", "cumcount", "count"])

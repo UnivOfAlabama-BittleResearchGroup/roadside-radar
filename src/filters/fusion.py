@@ -189,7 +189,7 @@ def loglikelihood(
 
     H = build_h_matrix().to(torch.float32).to(device)
 
-    R = build_r_matrix(pos_error=2.5, d_pos_error=1.5).to(torch.float32).to(device)
+    R = build_r_matrix(d_pos_error=np.sqrt(1.5), s_pos_error=np.sqrt(5/3)).to(torch.float32).to(device)
 
     P_leader = torch.from_numpy(
         df["P_leader"]
@@ -408,7 +408,7 @@ class IMF:
 
         Dt = torch.zeros((self.t_dim, self.v_dim, self.z_dim), dtype=torch.float32)
         X = torch.zeros(
-            (self.t_dim, self.v_dim, self.z_dim, self.x_dim), dtype=torch.float32
+            (self.t_dim, self.v_dim, self.z_dim, self.x_dim ), dtype=torch.float32
         )
         P = torch.zeros(
             (self.t_dim, self.v_dim, self.z_dim, self.x_dim, self.x_dim),
@@ -424,12 +424,17 @@ class IMF:
         X[t_index, v_index, z_index] = torch.from_numpy(
             df[
                 [
-                    s_col,
+                    # "s",
+                    # "front_s",
+                    # "back_s",
+                    "s",
                     "s_velocity",
                     "s_accel",
                     "d",
                     "d_velocity",
                     "d_accel",
+                    # "distanceToFront_s",
+                    # "distanceToBack_s",
                 ]
             ]
             .cast(pl.Float32)
@@ -592,6 +597,8 @@ class CI(IMF):
         R = build_r_matrix().to(self.device)
         H = build_h_matrix().to(self.device)
 
+        # special
+
         for t in tqdm(range(1, self.t_dim)):
             x_t = self.X[t]
             p_t = self.P[
@@ -609,7 +616,7 @@ class CI(IMF):
             ).to(self.device)
 
             self.X_hat[t] = (F @ self.X_hat[t - 1,].unsqueeze(-1)).squeeze()
-            self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2)  # + Q
+            self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2) + Q
             # do the recursive update
             # for z in range(self.z_dim, ):
             # update in reverse order
@@ -633,21 +640,23 @@ class CI(IMF):
                 #     # or to do the indexing. Going with Clone cause lazy
                 #     mask[mask.clone()] &= m_sq < chi2.ppf(0.99, 4)
 
-                omega = trace(p_t[mask, z]) / (
-                    trace(self.P_hat[t, mask]) + trace(p_t[mask, z])
+                omega = determinant(p_t[mask, z]) / (
+                    determinant(self.P_hat[t, mask]) + determinant(p_t[mask, z])
                 )
                 # clip omega to (0, 1)
 
                 # a1 = torch.linalg.lstsq()
 
                 a1 = omega[..., None, None] * torch.linalg.pinv(
-                    self.P_hat[t, mask], hermitian=True
+                    self.P_hat[t, mask],
                 )
                 a2 = (1 - omega[..., None, None]) * torch.linalg.pinv(
-                    p_t[mask, z], hermitian=True
+                    p_t[mask, z],
                 )
 
-                self.P_hat[t, mask] = torch.linalg.pinv(a1 + a2, hermitian=True)
+                self.P_hat[t, mask] = torch.linalg.pinv(
+                    a1 + a2,
+                )
                 self.X_hat[t, mask] = (
                     self.P_hat[t, mask]
                     @ (
@@ -665,30 +674,103 @@ class ImprovedFastCI(IMF):
         # CALCFilter.w_d = 1
 
         R = build_r_matrix(
-            pos_error=1, pos_velo_error=0, d_pos_error=0, d_velo_error=0, dims=4
+            pos_error=np.sqrt(0.5), pos_velo_error=np.sqrt(0.8112), d_pos_error=np.sqrt(0.1), d_velo_error=np.sqrt(0.1), dims=4
         ).to(self.device)
         H = build_h_matrix(dims=4).to(self.device)
+        # cutoff = chi2.ppf(0.999, 4)
 
         # # # # # scale R to a x,dim x dim matrix
         P_mod = (
             H.T @ R @ H
         )  # / 10 #+ CALCFilter.P_mod * torch.eye(self.x_dim).to(self.device)
-
+        self.P += P_mod
+        self.P_hat += P_mod
         # self.P[:, ...]  += P_mod.clone() #+ CALCFilter.P_mod * torch.eye(self.x_dim).to(self.device)
         # self.P_hat[0, ...] = P_mod
         # # self.P = torch.clamp(self.P, min=0, max=15)
         # self.P_hat = torch.clamp(self.P_hat, min=0, max=1)
-        self.P = (
-            torch.clamp(
-                self.P,
-                min=1e-9,
-            )
+        # self.P = (
+            # torch.clamp(
+            #     self.P,
+            #     min=1e-9,
+            # )
             # + P_mod
-        )
+        # )
+
+        # dt = 0.1
+
+        # P_H = torch.FloatTensor([
+        #     [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, ],
+        #     [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, ],
+        #     [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, ],
+        #     [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, ],
+        #     [0, 0, 0, 0, 0, 0, 1, 0, 0, 0, ],
+        #     [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, ],
+        #     ]).to(self.device)
+
+        # F = torch.FloatTensor([
+        #     [0, 0, 1, dt, 0.5 * dt ** 2, 0, 0, 0, 1, 0],  # s_f
+        #     [0, 0, 1, dt, 0.5 * dt ** 2, 0, 0, 0, 0, 1],  # s_b
+        #     [0, 0, 1, dt, 0.5 * dt ** 2, 0, 0, 0, 0, 0],  # s
+        #     [0, 0, 0, 1, dt, 0, 0, 0, 0, 0], # s_dot
+        #     [0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
+        #     [0, 0, 0, 0, 0, 1, dt, 0.5 * dt ** 2, 0, 0],
+        #     [0, 0, 0, 0, 0, 0, 1, dt, 0, 0],
+        #     [0, 0, 0, 0, 0, 0, 0, 1, 0, 0],
+        #     [0, 0, 0, 0, 0, 0, 0, 0, 1, 0],
+        #     [0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        # ]).to(self.device)
+
+
+        # self.P = (P_H.T @ self.P @ P_H)
+        # self.P_hat = (P_H.T @ self.P_hat @ P_H)
+
+        # # inject noise in the 
+        # self.P[..., 0, 0] = self.P[..., 2, 2].clone()
+        # self.P[..., 0, 2:] = self.P[..., 2, 2:].clone()
+        # # inject more noise
+        # self.P[..., 1, 1] = self.P[..., 2, 2].clone()
+        # self.P[..., 1, 2:] = self.P[..., 2, 2:].clone()
+        # # add noise in the dist to front/back
+        # self.P[..., 8, 8] = 0.8
+        # self.P[..., 9, 9] = 0.8
+
+        # Q = CALCFilter.Q_static(
+        #         dt_vect=dt,
+        #     shape=(self.v_dim, self.x_dim, self.x_dim),
+        # )
+
+        # Q_big = torch.zeros((self.v_dim, 10, 10))
+
+        # P
+
+
+        # Q_big[:, 2:-2, 2:-2] = Q
+        # Q_big[:, 0, ] = Q_big[:, 2, :].clone()
+        # Q_big[:, 1, ] = Q_big[:, 2, :].clone()
+        # Q_big[:, 9, 9] = 0.8
+        # Q_big[:, 8, 8] = 0.8
+
 
         # where are there more than 1 measurement? When this happens, we augment the uncertainty
         # P_slicer = ((self.X.abs().sum(axis=-1) > 0).sum(axis=2) > 1)
-        # self.P[P_slicer] += P_mod
+        # self.P += P_mod
+        # self.P_hat += P_mod
+
+        # special_H = torch.FloatTensor(
+        #     np.array(
+        #         [
+        #             [1, 1, 1, 0, 0, 0, 0, 0],
+        #             # [0, 0, 0, 0, 0, 0, 0, 0],
+        #             # [0, 0, 0, 0, 0, 0, 0, 0],
+        #             [0, 0, 0, 1, 0, 0, 0, 0],
+        #             [0, 0, 0, 0, 1, 0, 0, 0],
+        #             [0, 0, 0, 0, 0, 1, 0, 0],
+        #             [0, 0, 0, 0, 0, 0, 1, 0],
+        #             [0, 0, 0, 0, 0, 0, 0, 1],
+        #         ]
+        #     ),
+        # ).to(self.device)
 
         for t in tqdm(range(1, self.t_dim)):
             x_t = self.X[t]
@@ -696,19 +778,34 @@ class ImprovedFastCI(IMF):
 
             F = CALCFilter.F_static(
                 dt_vect=self.Dt[t, :, 0],
-                shape=(self.v_dim, self.x_dim, self.x_dim),
+                shape=(self.v_dim, self.x_dim , self.x_dim ),
+                # duplicate_pos_count=3,
             ).to(self.device)
 
             Q = CALCFilter.Q_static(
                 dt_vect=self.Dt[t, :, 0],
-                shape=(self.v_dim, self.x_dim, self.x_dim),
+                shape=(self.v_dim, self.x_dim , self.x_dim ),
+                # duplicate_pos_count=3
             ).to(self.device)
 
+            # F = (F )
+
             self.X_hat[t] = (F @ self.X_hat[t - 1,].unsqueeze(-1)).squeeze()
-            self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2)  + Q
+            # self.P_hat[t] = F[:, 2:, 2:] @ self.P_hat[t - 1,] @ F[:, 2:, 2:].transpose(-1, -2)  # + Q
+            self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2) + Q
 
             for z in range(self.z_dim):
+
                 mask = x_t[:, z].abs().sum(axis=-1) > 0.1
+
+                # if z > 0:
+                #     # compute the mahalonobis distance
+                #     y = ((x_t[mask, z] - self.X_hat[t, mask]) @ H.T).unsqueeze(-1)
+                #     S = H @ (p_t[mask, z] + self.P_hat[t, mask]) @ H.T #+ R
+                #     d = ((y.mT @ torch.linalg.pinv(S) @ y)).squeeze() #+ torch.logdet(S)
+                #     # p_t[mask, z] += P_mod
+                #     # self.P_hat[t, mask] += P_mod
+                #     mask[mask.clone()] &= (d <= cutoff)
 
                 I_i = torch.linalg.pinv(
                     p_t[mask, z],
@@ -737,10 +834,11 @@ class ImprovedFastCI(IMF):
 class MeasurementCI(IMF):
     def apply_filter(self) -> None:
         H = build_h_matrix().to(self.device)
-        R = build_r_matrix(pos_error=2.5, d_pos_error=1.5).to(self.device)
+        R = build_r_matrix(pos_error=0.5, d_pos_error=1.5).to(self.device)
         eye = torch.eye(self.x_dim).to(self.device)
         # diag_mask = torch.eye(self.x_dim).byte()
         # other_mask = ~diag_mask
+        
 
         for t in tqdm(range(1, self.t_dim)):
             x_t = self.X[t]

@@ -34,7 +34,7 @@ def build_h_matrix() -> FloatTensor:
     )
 
 
-def build_r_matrix(pos_error: float = 0.5, d_pos_error: float = 0.5) -> FloatTensor:
+def build_r_matrix(pos_error: float = None, d_pos_error: float = None) -> FloatTensor:
     """
     Build the R matrix for the Kalman filter
 
@@ -45,13 +45,18 @@ def build_r_matrix(pos_error: float = 0.5, d_pos_error: float = 0.5) -> FloatTen
         0.1  # constant uncertainty based on the discretization of the frenet frame
     )
 
+    # pos_error = pos_error or np.sqrt(1.88)
+    pos_error = 0.5
+    # d_pos_error = d_pos_error or np.sqrt(0.7)
+    d_pos_error = 0.5
+
     return torch.Tensor(
         np.diag(
             [
                 pos_error + discretization_error,
-                1,
+                1.013779,
                 d_pos_error + discretization_error,
-                1,
+                0.5
             ]
         )
         ** 2,
@@ -106,10 +111,10 @@ class _VectorizedKalmanFilter:
 
     P_mod = 1
 
-    w_s = np.sqrt(1)
+    w_s = np.sqrt(2)
     w_d = np.sqrt(0.5)
 
-    stop_speed_threshold = 0.5
+    stop_speed_threshold = 0.2
 
     def __init__(
         self,
@@ -513,6 +518,7 @@ class _VectorizedKalmanFilter:
         return out_Xs.squeeze(), Ps
 
 
+
 class CALKFilter(_VectorizedKalmanFilter):
     # w_s = 10
     # w_d = 5
@@ -709,27 +715,32 @@ class CALCFilter(_VectorizedKalmanFilter):
 
     @staticmethod
     def F_static(
-        dt_vect: int, shape: Tuple[int, ...]
+        dt_vect: int, 
+        shape: Tuple[int, ...],
+        duplicate_pos_count: int = 1,
     ) -> TensorType["vehicle", "x_dim", "x_dim"]:
         F = torch.zeros(shape)
 
-        F[..., 0, 0] = 1
-        F[..., 0, 1] = dt_vect
-        F[..., 0, 2] = 0.5 * dt_vect**2
 
-        F[..., 1, 1] = 1
-        F[..., 1, 2] = dt_vect
+        for i in range(duplicate_pos_count):
 
-        F[..., 2, 2] = 1
+            F[..., i, i] = 1
+            F[..., i, (duplicate_pos_count - 1) + 1] = dt_vect
+            F[..., i, (duplicate_pos_count - 1) + 2] = 0.5 * dt_vect**2
 
-        F[..., 3, 3] = 1
-        F[..., 3, 4] = dt_vect
-        F[..., 3, 5] = 0.5 * dt_vect**2
+        F[..., i + 1, i + 1] = 1
+        F[..., i + 1, i + 2] = dt_vect
 
-        F[..., 4, 4] = 1
-        F[..., 4, 5] = dt_vect
+        F[..., i + 2, i + 2] = 1
 
-        F[..., 5, 5] = 1
+        F[..., i + 3, i + 3] = 1
+        F[..., i + 3, i + 4] = dt_vect
+        F[..., i + 3, i + 5] = 0.5 * dt_vect**2
+
+        F[..., i + 4, i + 4] = 1
+        F[..., i + 4, i + 5] = dt_vect
+
+        F[..., i + 5, i + 5] = 1
 
         return F
 
