@@ -189,7 +189,7 @@ def loglikelihood(
 
     H = build_h_matrix().to(torch.float32).to(device)
 
-    R = build_r_matrix(d_pos_error=np.sqrt(1.5), s_pos_error=np.sqrt(5/3)).to(torch.float32).to(device)
+    R = build_r_matrix(d_pos_error=np.sqrt(1.5), pos_error=np.sqrt(5/3)).to(torch.float32).to(device)
 
     P_leader = torch.from_numpy(
         df["P_leader"]
@@ -244,7 +244,7 @@ def association_loglikelihood_distance(
     device = pick_device(gpu)
 
     H = build_h_matrix(dims=dims).to(device)
-    R = build_r_matrix(d_pos_error=1.5, pos_error=2.5, dims=dims).to(device)
+    R = build_r_matrix(d_pos_error=np.sqrt(1.5), pos_error=np.sqrt(5/3), dims=dims).to(torch.float32).to(device)
     # R = build_r_matrix().to(device)
 
     P = torch.from_numpy(

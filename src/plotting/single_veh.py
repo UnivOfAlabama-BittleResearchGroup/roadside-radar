@@ -105,7 +105,7 @@ def plot_graph(
 
     pos = nx.spring_layout(
         full_sub,
-        k=20
+        k=10
         # weight="weight", iterations=200
     )  # positions for all nodes - seed for reproducibility
 
