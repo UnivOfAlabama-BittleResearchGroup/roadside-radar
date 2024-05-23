@@ -322,6 +322,79 @@ def build_leader_follower_entire_history_df(
     )
 
 
+def build_leader_follower_no_sort(
+    df: pl.DataFrame,
+    s_col: str = "s",
+    max_s_gap=200,
+    use_lane_index: bool = True,
+) -> pl.DataFrame:
+
+    keep_cols = [
+        "s",
+        "front_s",
+        "back_s",
+        "s_velocity",
+        "s_accel",
+        "d",
+        "d_velocity",
+        "d_accel",
+        "P",
+        "prediction",
+        "ip",
+        "length_s",
+        "lane_index",
+    ]
+
+    df = df.with_columns(
+        pl.struct(["lane", *(("lane_index",) if use_lane_index else ())])
+        .hash()
+        .alias("lane_hash")
+    )
+
+    exploded_df = (
+        df.select(["epoch_time", "lane", "lane_index", s_col, "object_id"])
+        .lazy()
+        .join(
+            df.select(["epoch_time", "lane", "lane_index", s_col, "object_id"]).lazy(),
+            on=["epoch_time", "lane"],
+            suffix="_other",
+        )
+        .filter((pl.col(f"{s_col}_leader") - pl.col(s_col)) < max_s_gap)
+        .select(["object_id", pl.col("object_id_other").alias("leader")])
+        .collect()
+    )
+
+    return (
+        exploded_df.join(
+            df.select(["object_id", "epoch_time", "lane", *keep_cols]),
+            on=[
+                "object_id",
+                "lane",
+            ],
+        )
+        .join(
+            df.select(["object_id", "epoch_time", "lane", *keep_cols]),
+            left_on=[
+                "leader",
+                "epoch_time",
+                "lane",
+            ],
+            right_on=[
+                "object_id",
+                "epoch_time",
+                "lane",
+            ],
+            how="inner",
+            suffix="_leader",
+        )
+        .sort("epoch_time")
+        .set_sorted("epoch_time")
+        .with_columns(
+            (pl.col(f"{s_col}_leader") - pl.col(s_col)).alias("s_gap"),
+        )
+    )
+
+
 @timeit
 @lazify
 def calc_assoc_liklihood_distance(
@@ -354,42 +427,12 @@ def calc_assoc_liklihood_distance(
 @lazify
 def calculate_match_indexes(
     df: pl.DataFrame,
-    min_time_threshold: float = 0.5,
 ) -> pl.DataFrame:
-    return (
-        df.lazy()
-        .with_columns(
-            pl.when(pl.col("leader") < pl.col("object_id"))
-            .then(pl.concat_list([pl.col("leader"), pl.col("object_id")]))
-            .otherwise(pl.concat_list([pl.col("object_id"), pl.col("leader")]))
-            .alias("pair")
-        )
-        # .with_columns(
-        #     (pl.col("prediction") | pl.col("prediction_leader")).alias(
-        #         "prediction_any"
-        #     ),
-        #     (pl.col('pair').cum_count() / 10)  # simpler way to get the "match time"
-        #     .over("pair")
-        #     .alias("match_time"),
-        # )
-        # .filter(
-        #     (
-        #         (~pl.col("prediction_any"))
-        #         | (pl.col("match_time") < min_time_threshold)
-        #     )
-        # )
-        .with_columns(
-            [
-                # ----------- Calculate the Time Headway ------------
-                ((pl.col("s_leader") - pl.col("s")) / pl.col("s_velocity")).alias(
-                    "headway"
-                ),
-                # pl.col("object_id").cumcount().over("pair").alias("sort_index"),
-            ]
-        )
-        # .sort(
-        #     ["epoch_time"],
-        # )
+    return df.lazy().with_columns(
+        pl.when(pl.col("leader") < pl.col("object_id"))
+        .then(pl.concat_list([pl.col("leader"), pl.col("object_id")]))
+        .otherwise(pl.concat_list([pl.col("object_id"), pl.col("leader")]))
+        .alias("pair")
     )
 
 
@@ -408,17 +451,26 @@ def pipe_gate_headway_calc(
         )
         .group_by("pair")
         .agg(
+            # find the minimum assoc. distance
             pl.col("association_distance").min().alias("association_distance_filt"),
+            # find the time that they are first joined
             pl.col("epoch_time")
             .filter(pl.col("association_distance") < association_dist_cutoff)
             .first()
             .alias("join_time"),
+            # identify the first time that are in following
             pl.col("epoch_time").first().alias("epoch_time"),
+            # identify the max time in following
             pl.col("epoch_time").last().alias("epoch_time_max"),
-            pl.col("prediction").filter(pl.col("association_distance") < association_dist_cutoff).first().alias("prediction"),
-            pl.col("prediction_leader").filter(pl.col("association_distance") < association_dist_cutoff).first().alias("prediction_leader"),
-            # pl.col("headway").ewm_mean(alpha=alpha).mean().alias("headway"),
-            pl.col("headway").mean().alias("headway"),
+            #
+            pl.col("prediction")
+            .filter(pl.col("association_distance") < association_dist_cutoff)
+            .first()
+            .alias("prediction"),
+            pl.col("prediction_leader")
+            .filter(pl.col("association_distance") < association_dist_cutoff)
+            .first()
+            .alias("prediction_leader"),
             pl.col("s_leader").first().alias("leader_s"),
             pl.col("s").first().alias("s"),
         )
@@ -480,36 +532,6 @@ def build_match_df(
                 # | (pl.col("headway") < time_headway_cutoff)
             )
         )
-        # .sort("epoch_time")
-        # .with_columns(
-        #     pl.when(pl.col("variable") == "object_id")
-        #     .then(pl.col("prediction"))
-        #     .otherwise(pl.col("prediction_leader"))
-        #     .alias("prediction"),
-        #     pl.when(pl.col("variable") == "object_id")
-        #     .then(pl.col("epoch_time_max"))
-        #     .otherwise(pl.col("epoch_time_max_leader"))
-        #     .alias("my_end_time"),
-        #     pl.when(pl.col("variable") == "object_id")
-        #     .then(pl.col("epoch_time_max_leader"))
-        #     .otherwise(pl.col("epoch_time_max"))
-        #     .alias("other_end_time"),
-        # )
-        # .drop(
-        #     ["epoch_time_max", "epoch_time_max_leader", "prediction_leader", "variable"]
-        # )
-        # .with_columns(
-        #     pl.col("prediction").cumsum().over("value").alias("prediction_count"),
-        #     pl.col("other_end_time")
-        #     .filter(~pl.col("prediction"))
-        #     .max()
-        #     .over("value")
-        #     .alias("other_end_time_max"),
-        # )
-        # # .filter(
-        # #     (pl.col("prediction_count") <= 1)
-        # #     & (pl.col("row_nr").count().over("row_nr") > 1)
-        # # )
         .collect()
     )
 
@@ -622,10 +644,7 @@ def build_fusion_df(
             | (pl.col("all_pred") & (pl.col("cumcount") == 1))
         )
         .filter(
-            ~(
-                (pl.col("all_pred") & (pl.col("timedelta") < prediction_length * 1e3))
-                
-            )
+            ~((pl.col("all_pred") & (pl.col("timedelta") < prediction_length * 1e3)))
         )
         .drop(["cumtime", "cumcount"])
         .collect()
@@ -821,13 +840,13 @@ def walk_graph_removals(
 
     if all(s < cutoff for s in graph_scores):
         return []
-    
+
     fresh_g = g.copy()
 
     # sort the edges by their node connectivity
     edges = list(sorted(g.edges, key=lambda x: g.degree(x[0]) + g.degree(x[1])))
     graph_scores = []
-    
+
     while i == 0 or (
         (i < max_removals) and not all(s < cutoff for s in graph_scores[-1])
     ):

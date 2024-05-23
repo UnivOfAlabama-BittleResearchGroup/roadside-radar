@@ -5,7 +5,7 @@ from typing import Tuple
 
 
 @lazify
-@timeit
+# @timeit
 def prepare_frenet_measurement(
     df: pl.DataFrame,
 ) -> pl.DataFrame:
@@ -84,7 +84,7 @@ def prepare_frenet_measurement(
 
 
 @lazify
-@timeit
+# @timeit
 def filter_short_trajectories(
     df: pl.DataFrame,
     minimum_distance_m: float = 10,
@@ -114,7 +114,7 @@ def filter_short_trajectories(
 
 
 @lazify
-@timeit
+# @timeit
 def build_extension(
     df: pl.DataFrame,
     seconds: float = 4,
@@ -251,7 +251,7 @@ def build_extension(
 
 
 @lazify
-@timeit
+# @timeit
 def add_timedelta(df: pl.DataFrame, vehicle_id_col: str = "kalman_id") -> pl.DataFrame:
     return (
         df.lazy()
@@ -266,7 +266,7 @@ def add_timedelta(df: pl.DataFrame, vehicle_id_col: str = "kalman_id") -> pl.Dat
 
 
 @lazify
-@timeit
+# @timeit
 def build_kalman_id(
     df: pl.DataFrame,
     split_time_delta: float = 4,
@@ -302,7 +302,7 @@ def build_kalman_id(
 
 
 @lazify
-@timeit
+# @timeit
 def build_kalman_df(
     df: pl.DataFrame,
     minimum_data_points: int = 10,

@@ -7,6 +7,7 @@ from shapely.geometry import Point, Polygon, LineString
 from shapely import affinity
 from shapely.ops import split
 from shapelysmooth import chaikin_smooth, taubin_smooth
+from scipy.interpolate import interp1d
 import polars as pl
 import geopandas as gpd
 import json
@@ -184,31 +185,48 @@ class Lane:
         self._fitted = True
         self._step_size = step_size
 
+        # self._smooth_array = np.stack([self._smoothed_linestring.xy]).T.reshape(-1, 2)
+
         return self
 
     def frenet2xy(self, df: pl.DataFrame, s_col: str, d_col: str) -> pl.DataFrame:
-        nearest_df = (
-            df.with_columns(pl.col(s_col).cast(float))
-            .sort(s_col)
-            .join_asof(
-                self.df.sort("s").rename({
-                    'x': 'x_lane',
-                    'y': 'y_lane',
-                }),
-                right_on="s",
-                left_on=s_col,
-                tolerance=self._step_size * 2,
-                suffix="_lane",
-            )
+        f = interp1d(
+            self.df["s"].to_numpy(),
+            self.df[["x", "y", "angle"]].to_numpy(),
+            axis=0,
+            bounds_error=False,
+            assume_sorted=True,
         )
+        res = f(df[s_col])
+
+        df = df.with_columns(
+            x_lane=pl.Series(res[:, 0]),
+            y_lane=pl.Series(res[:, 1]),
+            angle=pl.Series(res[:, 2]),
+        )
+
+        # nearest_df = (
+        #     df.with_columns(pl.col(s_col).cast(float))
+        #     .sort(s_col)
+        #     .join_asof(
+        #         self.df.sort("s").rename({
+        #             'x': 'x_lane',
+        #             'y': 'y_lane',
+        #         }),
+        #         right_on="s",
+        #         left_on=s_col,
+        #         tolerance=self._step_size * 2,
+        #         suffix="_lane",
+        #     )
+        # )
 
         # calculate the x and y position of the vehicle
-        nearest_df = nearest_df.with_columns(
-            x_lane=pl.col("x_lane") - pl.col(d_col) * pl.col("angle").sin(),
-            y_lane=pl.col("y_lane") + pl.col(d_col) * pl.col("angle").cos(),
+        df = df.with_columns(
+            x_lane_point=pl.col("x_lane") - pl.col(d_col) * pl.col("angle").sin(),
+            y_lane_point=pl.col("y_lane") + pl.col(d_col) * pl.col("angle").cos(),
         )
 
-        return nearest_df
+        return df
 
     @property
     def df(self) -> pl.DataFrame:
@@ -249,6 +267,10 @@ class Lane:
 
 
 class RoadNetwork:
+    
+    LANE_WIDTH = 3.55
+    LANE_NUM = 2
+
     def __init__(
         self,
         lane_gdf: gpd.GeoDataFrame,
@@ -279,7 +301,9 @@ class RoadNetwork:
         self._tree = None
 
     @property
-    def step_size(self, ) -> float:
+    def step_size(
+        self,
+    ) -> float:
         return self._step_size
 
     def _build_lanes(self) -> List[Lane]:
@@ -343,7 +367,7 @@ class RoadNetwork:
             p=2,
             distance_upper_bound=dist_upper_bound,
             eps=0,
-            workers=-1
+            workers=-1,
         )
 
         # assign a direction to the distance (i.e positive or negative)
