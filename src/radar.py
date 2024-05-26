@@ -1,13 +1,10 @@
 import os
-from typing import Dict, List, Set, Tuple, TYPE_CHECKING
+from typing import Dict, Tuple, TYPE_CHECKING
 import numpy as np
 import polars as pl
 import yaml
 import utm
-from shapely.geometry import Polygon
 import math
-
-from src.frenet import SplineLane
 
 
 if TYPE_CHECKING:
@@ -476,152 +473,152 @@ class BasicRadar:
             )
         )
 
-    @classmethod
-    @timeit
-    def map_frenet_lanes(
-        cls,
-        df: pl.DataFrame,
-        lanes: List[SplineLane],
-        distance_threshold: float = 3,
-        drop_outside: bool = True,
-        directed: bool = True,
-    ) -> pl.DataFrame:
-        """
-        *This will drop any data that is greater than distance_threshold from a lane*
+    # @classmethod
+    # @timeit
+    # def map_frenet_lanes(
+    #     cls,
+    #     df: pl.DataFrame,
+    #     lanes: List[SplineLane],
+    #     distance_threshold: float = 3,
+    #     drop_outside: bool = True,
+    #     directed: bool = True,
+    # ) -> pl.DataFrame:
+    #     """
+    #     *This will drop any data that is greater than distance_threshold from a lane*
 
-        Args:
-            df (pl.DataFrame): _description_
-            lanes (List[SplineLane]): _description_
-            distance_threshold (float, optional): _description_. Defaults to 6.
+    #     Args:
+    #         df (pl.DataFrame): _description_
+    #         lanes (List[SplineLane]): _description_
+    #         distance_threshold (float, optional): _description_. Defaults to 6.
 
-        Returns:
-            pl.DataFrame: _description_
-        """
+    #     Returns:
+    #         pl.DataFrame: _description_
+    #     """
 
-        from scipy.spatial import KDTree
+    #     from scipy.spatial import KDTree
 
-        # create a dataframe of all the lanes
-        kdtree_df = pl.concat(
-            [
-                lane.fitted_pl_df.with_columns(
-                    [
-                        pl.lit(lane.name).alias("lane"),
-                    ]
-                )
-                for lane in lanes
-            ]
-        ).with_row_count()
+    #     # create a dataframe of all the lanes
+    #     kdtree_df = pl.concat(
+    #         [
+    #             lane.fitted_pl_df.with_columns(
+    #                 [
+    #                     pl.lit(lane.name).alias("lane"),
+    #                 ]
+    #             )
+    #             for lane in lanes
+    #         ]
+    #     ).with_row_count()
 
-        # create a kdtree
-        kdtree = KDTree(kdtree_df[["x", "y"]].to_numpy())
+    #     # create a kdtree
+    #     kdtree = KDTree(kdtree_df[["x", "y"]].to_numpy())
 
-        # get the nearest lane
-        d, nearest_lane_index = kdtree.query(
-            df[["utm_x", "utm_y"]].to_numpy(),
-            k=1,
-            distance_upper_bound=distance_threshold,
-            p=2,
-            workers=-1,
-            eps=1e-9,
-        )
+    #     # get the nearest lane
+    #     d, nearest_lane_index = kdtree.query(
+    #         df[["utm_x", "utm_y"]].to_numpy(),
+    #         k=1,
+    #         distance_upper_bound=distance_threshold,
+    #         p=2,
+    #         workers=-1,
+    #         eps=1e-9,
+    #     )
 
-        # replace the inf values with nan
-        df = (
-            df.with_columns(
-                [
-                    pl.Series(
-                        "lane_ind",
-                        nearest_lane_index,
-                        dtype=pl.UInt32,
-                    ),
-                    pl.Series(
-                        "min_d",
-                        d,
-                        dtype=pl.Float32,
-                    ),
-                ]
-            )
-            # get the nearest lane
-            .join(
-                kdtree_df,
-                how="inner" if drop_outside else "left",
-                left_on="lane_ind",
-                right_on="row_nr",
-            )
-        )
-        return (
-            df.pipe(
-                cls._get_directed_d,
-            )
-            if directed
-            else df
-        )
+    #     # replace the inf values with nan
+    #     df = (
+    #         df.with_columns(
+    #             [
+    #                 pl.Series(
+    #                     "lane_ind",
+    #                     nearest_lane_index,
+    #                     dtype=pl.UInt32,
+    #                 ),
+    #                 pl.Series(
+    #                     "min_d",
+    #                     d,
+    #                     dtype=pl.Float32,
+    #                 ),
+    #             ]
+    #         )
+    #         # get the nearest lane
+    #         .join(
+    #             kdtree_df,
+    #             how="inner" if drop_outside else "left",
+    #             left_on="lane_ind",
+    #             right_on="row_nr",
+    #         )
+    #     )
+    #     return (
+    #         df.pipe(
+    #             cls._get_directed_d,
+    #         )
+    #         if directed
+    #         else df
+    #     )
 
-    @classmethod
-    @timeit
-    def map_frenet_lane_constrained(
-        cls,
-        df: pl.DataFrame,
-        lanes: List[SplineLane],
-        filter_expr: pl.Expr,
-        distance_threshold: float = 6,
-        lane_col: str = "lane",
-    ) -> pl.DataFrame:
-        if "row_nr" not in df.columns:
-            df = df.with_row_count()
+    # @classmethod
+    # @timeit
+    # def map_frenet_lane_constrained(
+    #     cls,
+    #     df: pl.DataFrame,
+    #     lanes: List[SplineLane],
+    #     filter_expr: pl.Expr,
+    #     distance_threshold: float = 6,
+    #     lane_col: str = "lane",
+    # ) -> pl.DataFrame:
+    #     if "row_nr" not in df.columns:
+    #         df = df.with_row_count()
 
-        snap_df = df.filter(filter_expr)
+    #     snap_df = df.filter(filter_expr)
 
-        new_dfs = []
-        for l in lanes:
-            l_df = snap_df.filter((pl.col(lane_col) == l.name))
-            # create a dataframe of all the lanes
-            d, ind = l.kdtree.query(
-                l_df[["utm_x", "utm_y"]].to_numpy(),
-                p=2,
-                workers=-1,
-                distance_upper_bound=distance_threshold,
-            )
-            ltree_df = l.fitted_pl_df
-            l_df = (
-                l_df.with_columns(
-                    [
-                        pl.Series(
-                            "lane_ind",
-                            ind,
-                            dtype=pl.UInt32,
-                        ),
-                        pl.Series(
-                            "min_d",
-                            d,
-                            dtype=pl.Float64,
-                        ),
-                    ]
-                )
-                .drop(ltree_df.columns)
-                .join(
-                    ltree_df.with_row_count(),
-                    how="inner",
-                    left_on="lane_ind",
-                    right_on="row_nr",
-                )
-                .pipe(
-                    cls._get_directed_d,
-                )
-            )
+    #     new_dfs = []
+    #     for l in lanes:
+    #         l_df = snap_df.filter((pl.col(lane_col) == l.name))
+    #         # create a dataframe of all the lanes
+    #         d, ind = l.kdtree.query(
+    #             l_df[["utm_x", "utm_y"]].to_numpy(),
+    #             p=2,
+    #             workers=-1,
+    #             distance_upper_bound=distance_threshold,
+    #         )
+    #         ltree_df = l.fitted_pl_df
+    #         l_df = (
+    #             l_df.with_columns(
+    #                 [
+    #                     pl.Series(
+    #                         "lane_ind",
+    #                         ind,
+    #                         dtype=pl.UInt32,
+    #                     ),
+    #                     pl.Series(
+    #                         "min_d",
+    #                         d,
+    #                         dtype=pl.Float64,
+    #                     ),
+    #                 ]
+    #             )
+    #             .drop(ltree_df.columns)
+    #             .join(
+    #                 ltree_df.with_row_count(),
+    #                 how="inner",
+    #                 left_on="lane_ind",
+    #                 right_on="row_nr",
+    #             )
+    #             .pipe(
+    #                 cls._get_directed_d,
+    #             )
+    #         )
 
-            new_dfs.append(l_df)
+    #         new_dfs.append(l_df)
 
-        if not new_dfs:
-            return df
+    #     if not new_dfs:
+    #         return df
 
-        new_df = pl.concat(new_dfs)
+    #     new_df = pl.concat(new_dfs)
 
-        return df.update(
-            new_df,
-            how="left",
-            on=["row_nr"],
-        )
+    #     return df.update(
+    #         new_df,
+    #         how="left",
+    #         on=["row_nr"],
+    #     )
 
     @classmethod
     @timeit
@@ -658,53 +655,53 @@ class BasicRadar:
             .collect()
         )
 
-    @classmethod
-    @timeit
-    def norm_s_to_stopbar(
-        cls, df: pl.DataFrame, lanes: List[SplineLane]
-    ) -> pl.DataFrame:
-        assert (
-            "tl" in df.columns
-        ), "tl must be in the dataframe. This should map a radar to the traffic signal"
-        assert (
-            "s_int" in df.columns
-        ), "s_int must be in the dataframe. Call get_s_frame_lateral_error_df first"
+    # @classmethod
+    # @timeit
+    # def norm_s_to_stopbar(
+    #     cls, df: pl.DataFrame, lanes: List[SplineLane]
+    # ) -> pl.DataFrame:
+    #     assert (
+    #         "tl" in df.columns
+    #     ), "tl must be in the dataframe. This should map a radar to the traffic signal"
+    #     assert (
+    #         "s_int" in df.columns
+    #     ), "s_int must be in the dataframe. Call get_s_frame_lateral_error_df first"
 
-        local_df = df.lazy().with_columns([pl.lit(0).alias("s_int_norm")])
+    #     local_df = df.lazy().with_columns([pl.lit(0).alias("s_int_norm")])
 
-        for l in lanes:
-            for detector in l.detectors:
-                local_df = local_df.with_columns(
-                    pl.when(
-                        (pl.col("lane") == l.name)
-                        & (pl.col("tl") == detector.attrs["tl"])
-                    )
-                    .then((pl.col("s_int") - detector.s))
-                    .otherwise(pl.col("s_int_norm"))
-                    .alias("s_int_norm")
-                )
+    #     for l in lanes:
+    #         for detector in l.detectors:
+    #             local_df = local_df.with_columns(
+    #                 pl.when(
+    #                     (pl.col("lane") == l.name)
+    #                     & (pl.col("tl") == detector.attrs["tl"])
+    #                 )
+    #                 .then((pl.col("s_int") - detector.s))
+    #                 .otherwise(pl.col("s_int_norm"))
+    #                 .alias("s_int_norm")
+    #             )
 
-        local_df = local_df.collect()
+    #     local_df = local_df.collect()
 
-        # reverse the sign of subtraction for radars that point in the opposite direction
-        reverse = (
-            local_df.groupby(["ip", "lane"])
-            .agg([pl.col("s_int_norm").mean().alias("s_int_norm")])
-            .filter(pl.col("s_int_norm") < 0)
-            .select(["ip", "lane"])
-        )
+    #     # reverse the sign of subtraction for radars that point in the opposite direction
+    #     reverse = (
+    #         local_df.groupby(["ip", "lane"])
+    #         .agg([pl.col("s_int_norm").mean().alias("s_int_norm")])
+    #         .filter(pl.col("s_int_norm") < 0)
+    #         .select(["ip", "lane"])
+    #     )
 
-        return local_df.with_columns(
-            [
-                pl.when(
-                    pl.col("ip").is_in(reverse["ip"])
-                    & pl.col("lane").is_in(reverse["lane"])
-                )
-                .then(pl.col("s_int_norm") * -1)
-                .otherwise(pl.col("s_int_norm"))
-                .alias("s_int_norm")
-            ]
-        )
+    #     return local_df.with_columns(
+    #         [
+    #             pl.when(
+    #                 pl.col("ip").is_in(reverse["ip"])
+    #                 & pl.col("lane").is_in(reverse["lane"])
+    #             )
+    #             .then(pl.col("s_int_norm") * -1)
+    #             .otherwise(pl.col("s_int_norm"))
+    #             .alias("s_int_norm")
+    #         ]
+    #     )
 
     @timeit
     def correct_center(

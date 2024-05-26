@@ -430,7 +430,7 @@ class _VectorizedKalmanFilter:
                 maha = ((U @ self._y[mask].unsqueeze(-1)).squeeze() ** 2).sum(axis=-1)
                 likelihood[mask] = -0.5 * (self._log2pi * rank + logdet + maha)
                 break
-            except RuntimeError as e:
+            except RuntimeError:
                 # find which vehicle is causing the problem
                 bad_inds = torch.where(
                     torch.any(
@@ -507,7 +507,7 @@ class _VectorizedKalmanFilter:
             try:
                 K = Ps[k, mask] @ F_last.transpose(-1, -2) @ Pp.pinverse()
 
-            except RuntimeError as e:
+            except RuntimeError:
                 if Pp.isnan().all():
                     # end of the line for k
                     K = Ps[k, mask] @ F_last.transpose(-1, -2)
@@ -1065,7 +1065,7 @@ class IMMFilter:
         try:
             vals, vecs = torch.linalg.eigh(S)
         except RuntimeError as e:
-            print(f"eigh failed")
+            print("eigh failed")
             raise e
 
         logdet = torch.log(vals).sum(

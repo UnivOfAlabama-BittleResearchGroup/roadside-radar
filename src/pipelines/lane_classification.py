@@ -1,10 +1,6 @@
-from typing import Dict
-import numpy as np
 import polars as pl
 from src.geometry import RoadNetwork
 from src.pipelines.utils import lazify, timeit
-import torch
-import pomegranate as pmg
 
 
 @lazify
@@ -39,26 +35,6 @@ def label_lane(
             .otherwise(None)
         )
         .alias("lane_index")
-        # .otherwise(
-        #     pl.when(
-        #         pl.col("d").is_between(
-        #             right_lane_center - half_lane_width,
-        #             right_lane_center + half_lane_width,
-        #         )
-        #     )
-        #     .then(0)
-        #     .otherwise(
-        #         pl.when(
-        #             pl.col("d").is_between(
-        #                 left_lane_center_eb - half_lane_width,
-        #                 left_lane_center_eb + half_lane_width,
-        #             )
-        #         )
-        #         .then(1)
-        #         .otherwise(None)
-        #     )
-        # )
-        # .alias("lane_index")
     )
 
 

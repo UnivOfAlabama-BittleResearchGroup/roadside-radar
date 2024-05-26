@@ -1,8 +1,7 @@
 import numpy as np
 import pandas as pd
 import polars as pl
-from scipy.spatial.distance import directed_hausdorff
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.preprocessing import StandardScaler
 import fastdtw
 
 

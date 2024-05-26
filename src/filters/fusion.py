@@ -1,400 +1,15 @@
 import gc
 from typing import List, Union
-from itertools import permutations
 import numpy as np
 import torch
 import polars as pl
 from tqdm import tqdm
 import pyarrow as pa
-from scipy.stats import chi2
 
+from src.filters.metrics import build_h_matrix, build_r_matrix
 from src.filters.vectorized_kalman import (
-    # build_h_matrix,
-    # build_r_matrix,
-    CALKFilter,
-    CVLKFilter,
     CALCFilter,
-    pick_device,
-    gen_chunks,
 )
-
-
-def create_z_matrices_permute(df, Z_followers, Z_leaders, column_creator):
-    positions = ["s", "front_s", "back_s"]
-    # Create all combinations of leader and follower positions
-    for follower_pos, leader_pos in permutations(positions, 2):
-        # Append follower data to Z_followers
-        Z_followers.append(
-            torch.from_numpy(
-                df[column_creator(follower_pos, "")]
-                .to_numpy()
-                .copy()
-                .reshape(-1, 2, 1)
-                .astype(dtype=np.float32),
-            )
-        )
-
-        # Append leader data to Z_leaders
-        Z_leaders.append(
-            torch.from_numpy(
-                df[column_creator(leader_pos, "_leader")]
-                .to_numpy()
-                .copy()
-                .reshape(-1, 2, 1)
-                .astype(dtype=np.float32),
-            )
-        )
-
-
-def build_h_matrix(dims: int = 4) -> torch.FloatTensor:
-    """
-    Build the H matrix for the Kalman filter.
-
-    IDK why this is a function, but it is. ChatGPT made me do it
-    """
-    if dims == 6:
-        return torch.FloatTensor(
-            np.eye(6),
-        )
-
-    elif dims == 4:
-        return torch.FloatTensor(
-            np.array(
-                [
-                    [1, 0, 0, 0, 0, 0],
-                    [0, 1, 0, 0, 0, 0],
-                    [0, 0, 0, 1, 0, 0],
-                    [0, 0, 0, 0, 1, 0],
-                ]
-            ),
-        )
-    elif dims == 2:
-        return torch.FloatTensor(
-            np.array(
-                [
-                    [1, 0, 0, 0, 0, 0],
-                    [0, 0, 0, 1, 0, 0],
-                ]
-            ),
-        )
-
-
-def build_r_matrix(
-    pos_error: float = 1.5,
-    pos_velo_error: float = 1,
-    d_pos_error: float = 1.5,
-    d_velo_error: float = 1,
-    dims: int = 4,
-) -> torch.FloatTensor:
-    """
-    Build the R matrix for the Kalman filter.
-
-    IDK why this is a function, but it is. ChatGPT made me do it
-    """
-    if dims == 6:
-        return (
-            torch.FloatTensor(
-                np.diag(
-                    [
-                        pos_error,
-                        pos_velo_error,
-                        1,
-                        d_pos_error,
-                        d_velo_error,
-                        1,
-                    ]
-                ),
-            )
-            ** 2
-        )
-    elif dims == 4:
-        return (
-            torch.FloatTensor(
-                np.diag(
-                    [
-                        pos_error,
-                        pos_velo_error,
-                        d_pos_error,
-                        d_velo_error,
-                    ]
-                ),
-            )
-            ** 2
-        )
-    elif dims == 2:
-        return (
-            torch.FloatTensor(
-                np.diag(
-                    [
-                        pos_error,
-                        d_pos_error,
-                    ]
-                ),
-            )
-            ** 2
-        )
-
-
-def create_z_matrices(
-    df, Z_followers, Z_leaders, pos_override=None, dims: int = 4, permute: bool = False
-):
-    def column_creator(pos, ext):
-        if dims == 6:
-            return [
-                f"{pos}{ext}",
-                f"s_velocity{ext}",
-                f"s_accel{ext}",
-                f"d{ext}",
-                f"d_velocity{ext}",
-                f"d_accel{ext}",
-            ]
-        if dims == 4:
-            return [
-                f"{pos}{ext}",
-                f"s_velocity{ext}",
-                f"d{ext}",
-                f"d_velocity{ext}",
-            ]
-        elif dims == 2:
-            return [
-                f"{pos}{ext}",
-                f"d{ext}",
-            ]
-
-    if permute:
-        return create_z_matrices_permute(df, Z_followers, Z_leaders, column_creator)
-
-    if pos_override is None:
-        pos_override = ["s", "front_s", "back_s"]
-    for pos in pos_override:
-        for ext, l in zip(["_leader", ""], [Z_leaders, Z_followers]):
-            l.append(
-                torch.from_numpy(
-                    df[column_creator(pos, ext)]
-                    .to_numpy()
-                    .copy()
-                    .reshape(-1, dims, 1)
-                    .astype(
-                        dtype=np.float32,
-                    ),
-                )
-            )
-
-
-def loglikelihood(
-    df: pl.DataFrame,
-    gpu: bool = True,
-) -> pl.DataFrame:
-    device = torch.device("cuda" if gpu and torch.cuda.is_available() else "cpu")
-
-    H = build_h_matrix().to(torch.float32).to(device)
-
-    R = build_r_matrix(d_pos_error=np.sqrt(1.5), pos_error=np.sqrt(5/3)).to(torch.float32).to(device)
-
-    P_leader = torch.from_numpy(
-        df["P_leader"]
-        .to_numpy()
-        .copy()
-        .reshape(-1, 6, 6)
-        .astype(
-            dtype=np.float32,
-        )
-    ).to(device)
-
-    S_leader = H @ P_leader @ H.T + R
-
-    Z_followers = []
-    Z_leaders = []
-
-    create_z_matrices(df, Z_followers, Z_leaders)
-
-    Z_followers = torch.stack(Z_followers, dim=1).to(device)
-    Z_leaders = torch.stack(Z_leaders, dim=1).to(device)
-
-    _log2pi = torch.log(torch.tensor(2 * np.pi, dtype=torch.float32, device=device))
-
-    error = Z_followers - Z_leaders
-
-    vals, vecs = torch.linalg.eigh(S_leader)
-    logdet = torch.log(vals).sum(
-        axis=-1,
-    )
-    valsinv = 1 / vals
-    U = vecs * valsinv.sqrt().unsqueeze(-1)
-    rank = torch.linalg.matrix_rank(U)
-    maha = ((U[..., None, :, :] @ error).squeeze() ** 2).sum(axis=-1)
-    likelihood, _ = (-0.5 * (_log2pi * rank[..., None] + logdet[..., None] + maha)).max(
-        axis=-1
-    )
-    return df.with_columns(
-        [
-            pl.Series(likelihood.detach().cpu().numpy()).alias("loglikelihood"),
-        ]
-    )
-
-
-def association_loglikelihood_distance(
-    df: pl.DataFrame,
-    gpu: bool = True,
-    dims: int = 4,
-    # augment_length: bool = True,
-    length_cols: List[str] = ["length_s", "length_s_leader"],
-    permute: bool = False,
-) -> pl.DataFrame:
-    device = pick_device(gpu)
-
-    H = build_h_matrix(dims=dims).to(device)
-    R = build_r_matrix(d_pos_error=np.sqrt(1.5), pos_error=np.sqrt(5/3), dims=dims).to(torch.float32).to(device)
-    # R = build_r_matrix().to(device)
-
-    P = torch.from_numpy(
-        df["P_leader"]
-        .to_numpy()
-        .copy()
-        .reshape(-1, 6, 6)
-        .astype(
-            dtype=np.float32,
-        )
-    ).to(device)
-
-    P += torch.from_numpy(
-        df["P"]
-        .to_numpy()
-        .copy()
-        .reshape(-1, 6, 6)
-        .astype(
-            dtype=np.float32,
-        )
-    ).to(device)
-
-    # S = R
-    S = H @ P @ H.T
-    # if dims == 2:
-    S += R
-    # S = S
-
-    Z_followers = []
-    Z_leaders = []
-
-    create_z_matrices(df, Z_followers, Z_leaders, dims=dims, permute=permute)
-
-    # find if any overlap in the z_positions
-    Z_followers = torch.stack(Z_followers, dim=1).to(device)
-    Z_leaders = torch.stack(Z_leaders, dim=1).to(device)
-
-    Z_error = Z_followers - Z_leaders
-
-    d = (
-        (Z_error.transpose(-1, -2) @ S.pinverse()[..., None, :, :] @ Z_error).squeeze()
-        # + torch.logdet(S)[..., None]
-    )
-    # this is the associtiation liklihood bit
-    if device.type == "mps":
-        # d += torch.logdet(S.cpu())[..., None]
-        d = d.detach().cpu() + torch.logdet(S.cpu())[..., None]
-
-    else:
-        d += torch.logdet(S)[..., None]
-        d = d.detach().cpu()
-
-    # check 2d intersection of the measurements
-    # overlap =
-
-    d = d.min(axis=-1)[0].numpy()
-
-    # zero out all local tensors
-    del Z_followers
-    del Z_leaders
-    del Z_error
-    del P
-    del S
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
-    gc.collect()
-
-    return df.with_columns(
-        [
-            pl.Series(d).alias("association_distance"),
-        ]
-    )
-
-
-# def mahalanobis_distance(
-#     df: pl.DataFrame,
-#     cutoff: float = None,
-#     gpu: bool = True,
-#     pos_override=None,
-#     return_maha: bool = False,
-# ) -> pl.DataFrame:
-#     device = torch.device("cuda" if gpu else "cpu")
-
-#     H = build_h_matrix().to(device)
-
-#     R = build_r_matrix().to(device)
-
-#     P_follower = torch.from_numpy(
-#         df["P"]
-#         .to_numpy()
-#         .copy()
-#         .reshape(-1, 6, 6)
-#         .astype(
-#             dtype=np.float32,
-#         )
-#     ).to(device)
-
-#     P_leader = torch.from_numpy(
-#         df["P_leader"]
-#         .to_numpy()
-#         .copy()
-#         .reshape(-1, 6, 6)
-#         .astype(
-#             dtype=np.float32,
-#         )
-#     ).to(device)
-
-#     S_leader = H @ P_leader @ H.T + R
-#     S_follower = H @ P_follower @ H.T + R
-
-#     S = S_leader + S_follower
-
-#     Z_followers = []
-#     Z_leaders = []
-
-#     create_z_matrices(df, Z_followers, Z_leaders, pos_override=pos_override)
-
-#     Z_followers = torch.stack(Z_followers, dim=1).to(device)
-#     Z_leaders = torch.stack(Z_leaders, dim=1).to(device)
-#     Z_error = Z_followers - Z_leaders
-
-#     # calculate the mahalanobis distance
-#     m_sq = (
-#         Z_error.transpose(-1, -2)
-#         @ torch.linalg.pinv(
-#             S,
-#         )[..., None, :, :]
-#         @ Z_error
-#     ).squeeze()
-
-#     if return_maha:
-#         return df.with_columns(
-#             [
-#                 pl.Series(m_sq.detach().cpu().numpy()).alias("m_sq"),
-#             ]
-#         )
-
-#     assert cutoff is not None, "Must provide a cutoff"
-
-#     # find which is inside the gate
-#     inside_gate_1 = m_sq < cutoff
-
-#     inside_gate = (inside_gate_1).any(-1)
-
-#     return df.with_columns(
-#         [
-#             pl.Series(inside_gate.detach().cpu().numpy()).alias("inside_gate"),
-#         ]
-#     )
 
 
 class IMF:
@@ -408,7 +23,7 @@ class IMF:
 
         Dt = torch.zeros((self.t_dim, self.v_dim, self.z_dim), dtype=torch.float32)
         X = torch.zeros(
-            (self.t_dim, self.v_dim, self.z_dim, self.x_dim ), dtype=torch.float32
+            (self.t_dim, self.v_dim, self.z_dim, self.x_dim), dtype=torch.float32
         )
         P = torch.zeros(
             (self.t_dim, self.v_dim, self.z_dim, self.x_dim, self.x_dim),
@@ -482,11 +97,6 @@ class IMF:
             p_t = self.P[t]
 
             F = CALCFilter.F_static(
-                dt_vect=self.Dt[t],
-                shape=(self.v_dim, self.z_dim, self.x_dim, self.x_dim),
-            ).to(self.device)
-
-            Q = CALCFilter.Q_static(
                 dt_vect=self.Dt[t],
                 shape=(self.v_dim, self.z_dim, self.x_dim, self.x_dim),
             ).to(self.device)
@@ -590,15 +200,6 @@ class CI(IMF):
         super().__init__(df, *args, **kwargs)
 
     def apply_filter(self) -> None:
-        # CALKFilter.w_d = 1
-        # CALKFilter.w_s = 2
-        # CALKFilter.w_s = 0.1
-
-        R = build_r_matrix().to(self.device)
-        H = build_h_matrix().to(self.device)
-
-        # special
-
         for t in tqdm(range(1, self.t_dim)):
             x_t = self.X[t]
             p_t = self.P[
@@ -625,27 +226,9 @@ class CI(IMF):
 
                 mask = x_t[:, z].abs().sum(axis=-1) > 0.1
 
-                # if z > 0:
-                #     # only gate measurements that are > index 0
-                #     S = H @ self.P_hat[t, mask] @ H.T + R
-                #     z_error = ((x_t[mask, z, :] - self.X_hat[t, mask]) @ H.T).unsqueeze(
-                #         -1
-                #     )
-                #     # calculate the maha distance and gate it
-                #     m_sq = (
-                #         z_error.transpose(-1, -2) @ torch.pinverse(S) @ z_error
-                #     ).squeeze()
-
-                #     # IDK if more expensive to clone the mask
-                #     # or to do the indexing. Going with Clone cause lazy
-                #     mask[mask.clone()] &= m_sq < chi2.ppf(0.99, 4)
-
                 omega = determinant(p_t[mask, z]) / (
                     determinant(self.P_hat[t, mask]) + determinant(p_t[mask, z])
                 )
-                # clip omega to (0, 1)
-
-                # a1 = torch.linalg.lstsq()
 
                 a1 = omega[..., None, None] * torch.linalg.pinv(
                     self.P_hat[t, mask],
@@ -670,107 +253,20 @@ class ImprovedFastCI(IMF):
     #  from https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=1591849
 
     def apply_filter(self) -> None:
-        # CALCFilter.w_s = 2
-        # CALCFilter.w_d = 1
-
         R = build_r_matrix(
-            pos_error=np.sqrt(0.5), pos_velo_error=np.sqrt(0.8112), d_pos_error=np.sqrt(0.1), d_velo_error=np.sqrt(0.1), dims=4
+            pos_error=np.sqrt(0.5),
+            pos_velo_error=np.sqrt(0.8112),
+            d_pos_error=np.sqrt(0.1),
+            d_velo_error=np.sqrt(0.1),
+            dims=4,
         ).to(self.device)
         H = build_h_matrix(dims=4).to(self.device)
-        # cutoff = chi2.ppf(0.999, 4)
 
-        # # # # # scale R to a x,dim x dim matrix
         P_mod = (
             H.T @ R @ H
         )  # / 10 #+ CALCFilter.P_mod * torch.eye(self.x_dim).to(self.device)
         self.P += P_mod
         self.P_hat += P_mod
-        # self.P[:, ...]  += P_mod.clone() #+ CALCFilter.P_mod * torch.eye(self.x_dim).to(self.device)
-        # self.P_hat[0, ...] = P_mod
-        # # self.P = torch.clamp(self.P, min=0, max=15)
-        # self.P_hat = torch.clamp(self.P_hat, min=0, max=1)
-        # self.P = (
-            # torch.clamp(
-            #     self.P,
-            #     min=1e-9,
-            # )
-            # + P_mod
-        # )
-
-        # dt = 0.1
-
-        # P_H = torch.FloatTensor([
-        #     [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, ],
-        #     [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, ],
-        #     [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, ],
-        #     [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, ],
-        #     [0, 0, 0, 0, 0, 0, 1, 0, 0, 0, ],
-        #     [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, ],
-        #     ]).to(self.device)
-
-        # F = torch.FloatTensor([
-        #     [0, 0, 1, dt, 0.5 * dt ** 2, 0, 0, 0, 1, 0],  # s_f
-        #     [0, 0, 1, dt, 0.5 * dt ** 2, 0, 0, 0, 0, 1],  # s_b
-        #     [0, 0, 1, dt, 0.5 * dt ** 2, 0, 0, 0, 0, 0],  # s
-        #     [0, 0, 0, 1, dt, 0, 0, 0, 0, 0], # s_dot
-        #     [0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
-        #     [0, 0, 0, 0, 0, 1, dt, 0.5 * dt ** 2, 0, 0],
-        #     [0, 0, 0, 0, 0, 0, 1, dt, 0, 0],
-        #     [0, 0, 0, 0, 0, 0, 0, 1, 0, 0],
-        #     [0, 0, 0, 0, 0, 0, 0, 0, 1, 0],
-        #     [0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-        # ]).to(self.device)
-
-
-        # self.P = (P_H.T @ self.P @ P_H)
-        # self.P_hat = (P_H.T @ self.P_hat @ P_H)
-
-        # # inject noise in the 
-        # self.P[..., 0, 0] = self.P[..., 2, 2].clone()
-        # self.P[..., 0, 2:] = self.P[..., 2, 2:].clone()
-        # # inject more noise
-        # self.P[..., 1, 1] = self.P[..., 2, 2].clone()
-        # self.P[..., 1, 2:] = self.P[..., 2, 2:].clone()
-        # # add noise in the dist to front/back
-        # self.P[..., 8, 8] = 0.8
-        # self.P[..., 9, 9] = 0.8
-
-        # Q = CALCFilter.Q_static(
-        #         dt_vect=dt,
-        #     shape=(self.v_dim, self.x_dim, self.x_dim),
-        # )
-
-        # Q_big = torch.zeros((self.v_dim, 10, 10))
-
-        # P
-
-
-        # Q_big[:, 2:-2, 2:-2] = Q
-        # Q_big[:, 0, ] = Q_big[:, 2, :].clone()
-        # Q_big[:, 1, ] = Q_big[:, 2, :].clone()
-        # Q_big[:, 9, 9] = 0.8
-        # Q_big[:, 8, 8] = 0.8
-
-
-        # where are there more than 1 measurement? When this happens, we augment the uncertainty
-        # P_slicer = ((self.X.abs().sum(axis=-1) > 0).sum(axis=2) > 1)
-        # self.P += P_mod
-        # self.P_hat += P_mod
-
-        # special_H = torch.FloatTensor(
-        #     np.array(
-        #         [
-        #             [1, 1, 1, 0, 0, 0, 0, 0],
-        #             # [0, 0, 0, 0, 0, 0, 0, 0],
-        #             # [0, 0, 0, 0, 0, 0, 0, 0],
-        #             [0, 0, 0, 1, 0, 0, 0, 0],
-        #             [0, 0, 0, 0, 1, 0, 0, 0],
-        #             [0, 0, 0, 0, 0, 1, 0, 0],
-        #             [0, 0, 0, 0, 0, 0, 1, 0],
-        #             [0, 0, 0, 0, 0, 0, 0, 1],
-        #         ]
-        #     ),
-        # ).to(self.device)
 
         for t in tqdm(range(1, self.t_dim)):
             x_t = self.X[t]
@@ -778,34 +274,20 @@ class ImprovedFastCI(IMF):
 
             F = CALCFilter.F_static(
                 dt_vect=self.Dt[t, :, 0],
-                shape=(self.v_dim, self.x_dim , self.x_dim ),
+                shape=(self.v_dim, self.x_dim, self.x_dim),
                 # duplicate_pos_count=3,
             ).to(self.device)
 
             Q = CALCFilter.Q_static(
                 dt_vect=self.Dt[t, :, 0],
-                shape=(self.v_dim, self.x_dim , self.x_dim ),
+                shape=(self.v_dim, self.x_dim, self.x_dim),
                 # duplicate_pos_count=3
             ).to(self.device)
-
-            # F = (F )
-
             self.X_hat[t] = (F @ self.X_hat[t - 1,].unsqueeze(-1)).squeeze()
-            # self.P_hat[t] = F[:, 2:, 2:] @ self.P_hat[t - 1,] @ F[:, 2:, 2:].transpose(-1, -2)  # + Q
             self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2) + Q
 
             for z in range(self.z_dim):
-
                 mask = x_t[:, z].abs().sum(axis=-1) > 0.1
-
-                # if z > 0:
-                #     # compute the mahalonobis distance
-                #     y = ((x_t[mask, z] - self.X_hat[t, mask]) @ H.T).unsqueeze(-1)
-                #     S = H @ (p_t[mask, z] + self.P_hat[t, mask]) @ H.T #+ R
-                #     d = ((y.mT @ torch.linalg.pinv(S) @ y)).squeeze() #+ torch.logdet(S)
-                #     # p_t[mask, z] += P_mod
-                #     # self.P_hat[t, mask] += P_mod
-                #     mask[mask.clone()] &= (d <= cutoff)
 
                 I_i = torch.linalg.pinv(
                     p_t[mask, z],
@@ -829,123 +311,6 @@ class ImprovedFastCI(IMF):
                         + a2 @ x_t[mask, z].unsqueeze(-1)
                     )
                 ).squeeze()
-
-
-class MeasurementCI(IMF):
-    def apply_filter(self) -> None:
-        H = build_h_matrix().to(self.device)
-        R = build_r_matrix(pos_error=0.5, d_pos_error=1.5).to(self.device)
-        eye = torch.eye(self.x_dim).to(self.device)
-        # diag_mask = torch.eye(self.x_dim).byte()
-        # other_mask = ~diag_mask
-        
-
-        for t in tqdm(range(1, self.t_dim)):
-            x_t = self.X[t]
-            # p_t = self.P[t]
-            z_t = x_t @ H.T
-
-            F = CALCFilter.F_static(
-                dt_vect=self.Dt[t, :, 0],
-                shape=(self.v_dim, self.x_dim, self.x_dim),
-            ).to(self.device)
-
-            # Q = CALCFilter.Q_static(
-            #     dt_vect=self.Dt[t, :, 0],
-            #     shape=(self.v_dim, self.x_dim, self.x_dim),
-            # ).to(self.device)
-
-            self.X_hat[t] = (F @ self.X_hat[t - 1,].unsqueeze(-1)).squeeze()
-            self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2)  # + Q
-
-            omega = torch.tensor(0.5).to(self.device)
-
-            z_hat_t = self.X_hat[t] @ H.T
-
-            for z in range(self.z_dim):
-                mask = x_t[:, z].abs().sum(axis=-1) > 0.1
-
-                y = z_t[mask, z] - z_hat_t[mask]
-
-                sigma_y = H @ ((1 / omega) * self.P_hat[t, mask]) @ H.T + (
-                    R / (1 - omega)
-                )
-                K = (1 / omega) * self.P_hat[t, mask] @ H.T @ torch.linalg.pinv(sigma_y)
-
-                self.P_hat[t, mask] = (eye - K @ H) @ (
-                    (1 / omega) * self.P_hat[t, mask]
-                ) @ (eye - K @ H).mT + K @ (1 / (1 - omega) * R) @ K.mT
-
-                self.X_hat[t, mask] = (
-                    self.X_hat[t, mask] + (K @ y.unsqueeze(-1)).squeeze()
-                ).squeeze()
-
-
-# class SplitMeasurementCI(IMF):
-
-#     def __init__(self, df: pl.DataFrame, gpu: bool = True, s_col: str = "s") -> None:
-#         super().__init__(df, gpu, s_col)
-
-
-#     def apply_filter(self) -> None:
-#         H = build_h_matrix().to(self.device)
-#         R = build_r_matrix(pos_error=3, d_pos_error=1).to(self.device)
-#         R_d =
-
-#         for t in tqdm(range(1, self.t_dim)):
-#             x_t = self.X[t]
-#             p_t = self.P[t]
-#             z_t = x_t @ H.T
-
-#             F = CALCFilter.F_static(
-#                 dt_vect=self.Dt[t, :, 0],
-#                 shape=(self.v_dim, self.x_dim, self.x_dim),
-#             ).to(self.device)
-
-#             Q = CALCFilter.Q_static(
-#                 dt_vect=self.Dt[t, :, 0],
-#                 shape=(self.v_dim, self.x_dim, self.x_dim),
-#             ).to(self.device)
-
-#             # split the Q matrix
-#             Q_d = Q.clone()
-#             Q_d.masked_fill(diag_mask, 0)
-#             Q_i = Q.clone()
-#             Q_i.masked_fill(other_mask, 0)
-
-#             self.X_hat[t] = (F @ self.X_hat[t - 1,].unsqueeze(-1)).squeeze()
-
-#             # split the P matrix
-#             P_d = self.P_hat[t, :, ].clone()
-#             P_d.masked_fill(diag_mask, 0)
-#             P_i = self.P_hat[t, :, ].clone()
-#             P_i.masked_fill(other_mask, 0)
-
-#             omega = torch.tensor(0.5).to(self.device)
-
-#             for z in range(self.z_dim):
-#                 mask = x_t[:, z].abs().sum(axis=-1) > 0.1
-
-#                 z_hat_t = self.X_hat[t] @ H.T
-#                 y = z_t[mask, z] - z_hat_t[mask]
-
-#                 sigma_y = H @ (
-#                     (1 / omega) * self.P_hat[t, mask]
-#                 ) @ H.T + (R / (1 - omega))
-#                 K = (
-#                     (1 / omega)
-#                     * self.P_hat[t, mask]
-#                     @ H.T
-#                     @ torch.linalg.pinv(sigma_y)
-#                 )
-
-#                 self.P_hat[t, mask] = (eye - K @ H) @ (
-#                     (1 / omega) * self.P_hat[t, mask]
-#                 ) @ (eye - K @ H).mT + K @ (1 / (1 - omega) * R) @ K.mT
-
-#                 self.X_hat[t, mask] = (
-#                     self.X_hat[t, mask] + (K @ y.unsqueeze(-1)).squeeze()
-#                 ).squeeze()
 
 
 def batch_join(
@@ -976,23 +341,9 @@ def batch_join(
         dfs = []
 
         # create a list of the chunks
-        for chunk_df in (
-            filter_df
-            # # .filter(pl.col("filter"))
-            .with_columns(
-                (pl.col("vehicle_id_int") // batch_size).alias("chunk")
-            ).partition_by("chunk")
-            # tqdm(
-            #     # list(
-            #     gen_chunks(
-            #         filter_df,
-            #         chunk_size=batch_size,
-            #         vehicle_index="vehicle_id_int",
-            #         time_index="time_index",
-            #     )
-            #     # )
-            # )
-        ):
+        for chunk_df in filter_df.with_columns(
+            (pl.col("vehicle_id_int") // batch_size).alias("chunk")
+        ).partition_by("chunk"):
             offset = chunk_df["vehicle_id_int"].min()
 
             # create a new vehicle id
@@ -1027,12 +378,10 @@ def batch_join(
                     ],
                     how="inner",
                 )
-                # .with_columns(
-                #     (pl.col("vehicle_id_int") + offset).alias("vehicle_id_int")
-                # )
                 .drop("vehicle_id_int")
             )
 
+            # try to free GPU memory
             imf.cleanup()
             del imf
             torch.cuda.empty_cache()
@@ -1103,24 +452,6 @@ def rts_smooth(
     for chunk_df in df.with_columns(
         (pl.col("vehicle_id_int") // batch_size).alias("chunk")
     ).partition_by("chunk"):
-        # create a list of the chunks
-        # for chunk_df in (
-        #         df
-        #         # .filter(pl.col("filter"))
-        #         .with_columns(
-        #             (pl.col("vehicle_id_int") // batch_size).alias("chunk")
-        #         ).partition_by("chunk")
-        #         # tqdm(
-        #         #     list(
-        #         #         gen_chunks(
-        #         #             df,
-        #         #             chunk_size=batch_size,
-        #         #             vehicle_index="vehicle_id_int",
-        #         #             time_index="time_index",
-        #         #         )
-        #         #     )
-        #         # )
-        #     ):
         _inner_rts(dfs, chunk_df, device, s_col)
 
         torch.cuda.empty_cache()
@@ -1136,9 +467,6 @@ def _inner_rts(
             "vehicle_id_int"
         )
     )
-
-    # CALCFilter.w_s = 1
-    # CALCFilter.w_d = 2
 
     t_dim = chunk_df["time_index"].max() + 1
     v_dim = chunk_df["vehicle_id_int"].max() + 1

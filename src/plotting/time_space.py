@@ -1,8 +1,5 @@
-from datetime import timedelta
-from plotly.subplots import make_subplots
 import plotly.graph_objects as go
 import plotly.express as px
-import polars as pl
 
 
 def plot_time_space(
@@ -51,8 +48,8 @@ def plot_time_space(
         veh_df = veh_df.sort_values("epoch_time_cst")
         veh_df = veh_df.iloc[::every, :]
 
-        p_df = veh_df.loc[veh_df["prediction"] == True]
-        np_df = veh_df.loc[veh_df["prediction"] == False]
+        p_df = veh_df.loc[veh_df["prediction"]]
+        np_df = veh_df.loc[~veh_df["prediction"]]
 
         
 

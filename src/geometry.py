@@ -1,12 +1,11 @@
-from functools import lru_cache
 import math
 from typing import List, Union
 import numpy as np
 import pandas as pd
-from shapely.geometry import Point, Polygon, LineString
+from shapely.geometry import Point, LineString
 from shapely import affinity
 from shapely.ops import split
-from shapelysmooth import chaikin_smooth, taubin_smooth
+from shapelysmooth import chaikin_smooth
 from scipy.interpolate import interp1d
 import polars as pl
 import geopandas as gpd

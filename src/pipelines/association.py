@@ -1,13 +1,8 @@
-from datetime import timedelta
-from itertools import combinations
-from typing import List
-import numpy as np
 import polars as pl
-from src.filters.fusion import association_loglikelihood_distance
+from src.filters.metrics import association_loglikelihood_distance
 from src.pipelines.utils import lazify, timeit
 from scipy.stats import chi2
 import networkx as nx
-import heapq
 
 
 @lazify
@@ -16,7 +11,7 @@ def add_front_back_s(
     df: pl.DataFrame,
     use_median_length: bool = False,
     use_nearest_length: bool = False,
-    use_global_median: bool = False,
+    use_global_mean: bool = False,
     s_col: str = "s",
 ) -> pl.DataFrame:
     required_columns = {s_col, "distanceToFront_s", "distanceToBack_s", "length_s"}
@@ -27,30 +22,16 @@ def add_front_back_s(
     if use_median_length:
         # multiply the median length by the percent front and back
         raise NotImplementedError
-        # return (
-        #     df.with_columns(
-        #         pl.col("length_s").median().over("object_id").alias("median_length_s"),
-        #         (pl.col("distanceToFront_s") / pl.col("length_s")).alias(
-        #             "front_percent"
-        #         ),
-        #         (pl.col("distanceToBack_s") / pl.col("length_s")).alias("back_percent"),
-        #     )
-        #     .with_columns(
-        #         (pl.col("median_length_s") * pl.col("front_percent")).alias("front_s"),
-        #         (pl.col("median_length_s") * pl.col("back_percent")).alias("back_s"),
-        #     )
-        #     .drop(["median_length_s", "front_percent", "back_percent"])
-        # )
 
-    if use_global_median:
-        median_length = df.select(
-            pl.col("length_s").filter(pl.col("dist").is_between(10, 30)).median()
+    if use_global_mean:
+        mean_length = df.select(
+            pl.col("length_s").filter(pl.col("dist").is_between(10, 50)).mean()
         ).collect()["length_s"][0]
 
         return (
             df.with_columns(
-                pl.when((pl.col("dist") >= 30) & (pl.col("length_s") < median_length))
-                .then(pl.lit(median_length))
+                pl.when((pl.col("dist") >= 50) & (pl.col("length_s") < mean_length))
+                .then(pl.lit(mean_length))
                 .otherwise(pl.col("length_s"))
                 .alias("corrected_length_s")
             )
@@ -322,13 +303,13 @@ def build_leader_follower_entire_history_df(
     )
 
 
+@lazify
 def build_leader_follower_no_sort(
     df: pl.DataFrame,
     s_col: str = "s",
     max_s_gap=200,
     use_lane_index: bool = True,
 ) -> pl.DataFrame:
-
     keep_cols = [
         "s",
         "front_s",
@@ -349,50 +330,79 @@ def build_leader_follower_no_sort(
         pl.struct(["lane", *(("lane_index",) if use_lane_index else ())])
         .hash()
         .alias("lane_hash")
+    ).collect()
+
+    unique_pairs = []
+    # partion by the hour
+    for _df in df.with_columns(
+        pl.col("epoch_time").dt.date().alias("date"),
+        pl.col("epoch_time").dt.hour().alias("hour"),
+    ).partition_by(["date", "hour"]):
+        unique_pairs.append(
+            _df.select(["epoch_time", "lane_hash", s_col, "object_id"])
+            .lazy()
+            .join(
+                _df.select(["epoch_time", "lane_hash", s_col, "object_id"]).lazy(),
+                on=["epoch_time", "lane_hash"],
+                suffix="_other",
+            )
+            .filter(pl.col("object_id") != pl.col("object_id_other"))
+            .filter((pl.col(f"{s_col}_other") - pl.col(s_col)) < max_s_gap)
+            .select(
+                [
+                    "object_id",
+                    pl.col("object_id_other").alias("leader"),
+                ]
+            )
+            .with_columns(
+                pl.when(pl.col("object_id") < pl.col("leader"))
+                .then(pl.concat_list([pl.col("object_id"), pl.col("leader")]))
+                .otherwise(pl.concat_list([pl.col("leader"), pl.col("object_id")]))
+                .alias("pair"),
+            )
+            .select(
+                [
+                    "pair",
+                ]
+            )
+            .with_columns(
+                pl.col("pair").list.get(0).alias("object_id"),
+                pl.col("pair").list.get(1).alias("leader"),
+            )
+            .drop("pair")
+            .unique()
+            .join(
+                _df.lazy().select(["object_id", "epoch_time", "lane", *keep_cols]),
+                on="object_id",
+            )
+            .join(
+                _df.lazy().select(["object_id", "epoch_time", "lane", *keep_cols]),
+                left_on=[
+                    "leader",
+                    "epoch_time",
+                    "lane",
+                ],
+                right_on=[
+                    "object_id",
+                    "epoch_time",
+                    "lane",
+                ],
+                how="inner",
+                suffix="_leader",
+            )
+            .sort("epoch_time")
+            .set_sorted("epoch_time")
+            .with_columns(
+                (pl.col(f"{s_col}_leader") - pl.col(s_col)).alias("s_gap"),
+            )
+            .collect()
+        )
+
+    exploded_df = pl.concat(unique_pairs).unique(
+        ["object_id", "leader", 'epoch_time']
     )
 
-    exploded_df = (
-        df.select(["epoch_time", "lane", "lane_index", s_col, "object_id"])
-        .lazy()
-        .join(
-            df.select(["epoch_time", "lane", "lane_index", s_col, "object_id"]).lazy(),
-            on=["epoch_time", "lane"],
-            suffix="_other",
-        )
-        .filter((pl.col(f"{s_col}_leader") - pl.col(s_col)) < max_s_gap)
-        .select(["object_id", pl.col("object_id_other").alias("leader")])
-        .collect()
-    )
-
-    return (
-        exploded_df.join(
-            df.select(["object_id", "epoch_time", "lane", *keep_cols]),
-            on=[
-                "object_id",
-                "lane",
-            ],
-        )
-        .join(
-            df.select(["object_id", "epoch_time", "lane", *keep_cols]),
-            left_on=[
-                "leader",
-                "epoch_time",
-                "lane",
-            ],
-            right_on=[
-                "object_id",
-                "epoch_time",
-                "lane",
-            ],
-            how="inner",
-            suffix="_leader",
-        )
-        .sort("epoch_time")
-        .set_sorted("epoch_time")
-        .with_columns(
-            (pl.col(f"{s_col}_leader") - pl.col(s_col)).alias("s_gap"),
-        )
-    )
+    return exploded_df
 
 
 @timeit
@@ -403,6 +413,7 @@ def calc_assoc_liklihood_distance(
     batch_size: int = 100_000,
     dims: int = 4,
     permute: bool = False,
+    maha: bool = False,
 ) -> pl.DataFrame:
     import torch
 
@@ -413,7 +424,7 @@ def calc_assoc_liklihood_distance(
         .with_columns((pl.col("maha_ind") // batch_size).alias("chunk"))
         .partition_by("chunk")
     ):
-        dfs.append(association_loglikelihood_distance(_df, gpu, dims, permute))
+        dfs.append(association_loglikelihood_distance(_df, gpu, dims, permute, maha=maha))
 
     try:
         torch.cuda.empty_cache()
@@ -484,10 +495,9 @@ def build_match_df(
     traj_time_df: pl.DataFrame,
     assoc_cutoff: float,
     assoc_cutoff_pred: float,
-    time_headway_cutoff: float,
     # headway_cutoff_inner: float,
 ) -> pl.DataFrame:
-    valid_matches = (
+    return (
         df
         # .lazy()
         .sort("epoch_time")
@@ -496,7 +506,7 @@ def build_match_df(
             pl.col("pair").list.get(0).alias("object_id"),
             pl.col("pair").list.get(1).alias("leader"),
         )
-        .with_row_count()
+        # .with_row_count()
         .join(
             traj_time_df.lazy(),
             on="object_id",
@@ -507,38 +517,15 @@ def build_match_df(
             right_on="object_id",
             suffix="_leader",
         )
-        .collect()
-    )
-
-    keep_rows = (
-        valid_matches.lazy()
-        .melt(
-            id_vars=[
-                "epoch_time",
-                "row_nr",
-                "prediction",
-                "prediction_leader",
-                "epoch_time_max",
-                "epoch_time_max_leader",
-                "association_distance_filt",
-                "headway",
-            ]
-        )
         .filter(
             (
                 pl.when(~(pl.col("prediction") | pl.col("prediction_leader")))
                 .then(pl.col("association_distance_filt") <= assoc_cutoff)
                 .otherwise(pl.col("association_distance_filt") <= assoc_cutoff_pred)
-                # | (pl.col("headway") < time_headway_cutoff)
             )
         )
         .collect()
     )
-
-    return valid_matches.filter(
-        pl.col("row_nr").is_in(keep_rows["row_nr"].unique())
-    ).drop("row_nr")
-    # return valid_matches
 
 
 @timeit
@@ -643,9 +630,7 @@ def build_fusion_df(
             | (pl.col("count") == 1)
             | (pl.col("all_pred") & (pl.col("cumcount") == 1))
         )
-        .filter(
-            ~((pl.col("all_pred") & (pl.col("timedelta") < prediction_length * 1e3)))
-        )
+        .filter(~(pl.col("all_pred") & (pl.col("timedelta") < prediction_length * 1e3)))
         .drop(["cumtime", "cumcount"])
         .collect()
     )
@@ -768,135 +753,3 @@ def filter_bad_lane_matches(
             .collect(streaming=True)["pair"]
         )
     )
-
-
-def get_edge_attributes(G, name, cutoff):
-    # ...
-    edges = G.edges(data=True)
-    return (x[-1][name] or (cutoff - 1e-3) for x in edges)
-
-
-def get_graph_score(
-    sub_graph: nx.Graph,
-    # df: pl.DataFrame,
-    remove_edges: List[int] = (),
-    add_edges: List[int] = (),
-    reinstate_graph: bool = True,
-    big_G: nx.Graph = None,
-    cutoff: float = None,
-    # combs: List[str] = None,
-) -> float:
-    for remove in remove_edges:
-        sub_graph.remove_edge(*remove)
-
-    for add_edge in add_edges:
-        sub_graph.add_edge(*add_edge)
-
-    # return score
-    scores = []
-    for subgraph in nx.connected_components(sub_graph):
-        sg = big_G.subgraph(subgraph)
-        try:
-            scores.extend(get_edge_attributes(sg, "weight", cutoff))
-        except TypeError:
-            scores.append(cutoff - 0.0001)
-
-    if reinstate_graph:
-        for remove in remove_edges:
-            sub_graph.add_edge(*remove)
-
-        for add_edge in add_edges:
-            sub_graph.remove_edge(*add_edge)
-
-    return scores
-
-
-# def check_improvement(old_score, new_score, cutoff):
-
-#     # check that there is improvement over the last score
-#     return any(s < cutoff for s in new_score) and np.mean(new_score) < np.mean(old_score)
-from itertools import chain, combinations
-
-
-def powerset(iterable):
-    "powerset([1,2,3]) --> () (1,) (2,) (3,) (1,2) (1,3) (2,3) (1,2,3)"
-    s = list(iterable)  # allows duplicate elements
-    return chain.from_iterable(combinations(s, r) for r in range(len(s) + 1, 0, -1))
-
-
-def walk_graph_removals(
-    g: nx.Graph,
-    cutoff: float = chi2.ppf(0.95, 4),
-    max_removals: int = 3,
-    big_G: nx.Graph = None,
-):
-    i = 0
-    remove_edges = []
-    graph_scores = get_graph_score(
-        g,
-        big_G=big_G,
-        cutoff=cutoff,
-    )
-
-    if all(s < cutoff for s in graph_scores):
-        return []
-
-    fresh_g = g.copy()
-
-    # sort the edges by their node connectivity
-    edges = list(sorted(g.edges, key=lambda x: g.degree(x[0]) + g.degree(x[1])))
-    graph_scores = []
-
-    while i == 0 or (
-        (i < max_removals) and not all(s < cutoff for s in graph_scores[-1])
-    ):
-        # for _ in range(max_removals):
-        scores = []
-        for edge in edges:
-            score = get_graph_score(
-                # score_func,
-                g,
-                remove_edges=[edge],
-                big_G=big_G,
-                cutoff=cutoff,
-            )
-            # score = np.mean([s for s in score if s is not None])
-            # scores.append((score, edge))
-            heapq.heappush(scores, (sum(score) / (len(score) or 1), score, edge))
-
-        # # store the scores
-        # # keep any that reduce the score underneath the cutoff
-        # scores = sorted(scores, key=lambda x: np.mean(x[0]))
-        opt_edge = heapq.heappop(scores)
-
-        # check the score
-        remove_edges.append(opt_edge[-1])
-        graph_scores.append(opt_edge[1])
-
-        # remove what we don't need
-        g.remove_edge(*opt_edge[-1])
-        edges.remove(opt_edge[-1])
-
-        i += 1
-
-    # now loop and see if we can add any edges back and still satisfy the requirements.
-    # This happends for multiple reasons
-    # delete_edges = remove_edges.copy()
-    pop_edges = []
-    # all_valid_edges = set(fresh_g)
-    for i, edge in enumerate(remove_edges):
-        # edge = list(set(edge).union(all_valid_edges))
-        # if not len(edge):
-        #     continue
-        score = get_graph_score(g, add_edges=[edge], big_G=big_G, cutoff=cutoff)
-
-        if all(s < cutoff for s in score):
-            # print("adding_back", edge)
-            pop_edges.append(i)
-            g.add_edge(*edge)
-            # for e in edge:
-            # g.add_edge(*e)
-
-    remove_edges = list(nx.difference(fresh_g, g).edges)
-
-    return remove_edges

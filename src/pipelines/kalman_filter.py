@@ -68,9 +68,15 @@ def prepare_frenet_measurement(
             (pl.col("f32_velocityInDir_mps") * pl.col("angle_diff").cos()).alias(
                 "s_velocity"
             ),
+            # (pl.col("f32_velocityInDir_mps")).alias(
+            #     "s_velocity"
+            # ),
             (pl.col("f32_velocityInDir_mps") * pl.col("angle_diff").sin()).alias(
                 "d_velocity"
             ),
+            # pl.lit(0).cast(pl.Float32).alias(
+            #     "d_velocity"
+            # ),
             (pl.col("f32_distanceToFront_m") * pl.col("angle_diff").cos()).alias(
                 "distanceToFront_s"
             ),
@@ -183,71 +189,6 @@ def build_extension(
         .set_sorted(["object_id", "lane", "epoch_time"])
         .lazy()
     )
-
-
-#     return test
-# @lazify
-# @timeit
-# def build_extension(
-#     df: pl.DataFrame, seconds: float = 4, dt: float = 0.1
-# ) -> pl.DataFrame:
-#     # take the last data point from the radar, and then extend it
-#     df = df.lazy()
-
-#     # get the datatype of the epoch_time column
-#     time_dt = df.dtypes[df.columns.index("epoch_time")]
-
-#     test = (
-#         df.lazy()
-#         .group_by(["object_id", "lane"])
-#         .agg(
-#             pl.col("epoch_time").min(),
-#             pl.col("epoch_time").max().alias("max_time"),
-#             (
-#                 (
-#                     pl.col("epoch_time").max() - pl.col("epoch_time").min()
-#                 ).dt.milliseconds()
-#                 / 1e3
-#             ).alias("total_duration_ms"),
-#         )
-#         .with_columns(
-#             ((pl.col("total_duration_ms") + seconds) / dt).cast(int).alias("n_steps"),
-#             pl.lit(dt).alias("dt"),
-#         )
-#         .with_columns(
-#             pl.col("dt").repeat_by(pl.col("n_steps")).alias("dt"),
-#         )
-#         .explode("dt")
-#         .with_columns(
-#             (
-#                 pl.col("dt").cumsum().over(["object_id", "lane"]) * 1e3
-#                 + pl.col("epoch_time").cast(float)
-#             )
-#             .cast(time_dt)
-#             .alias("epoch_time")
-#         )
-#         .with_columns((pl.col("epoch_time") > pl.col("max_time")).alias("prediction"))
-#         .drop(["dt", "n_steps", "total_duration_ms", "max_time"])
-#         .join(
-#             df.with_columns(pl.lit(False).alias("missing_data")),
-#             on=["object_id", "epoch_time", "lane"],
-#             how="left",
-#         )
-#         .sort(by=["object_id", "lane", "epoch_time"])
-#         .with_columns(
-#             pl.col("missing_data").fill_null(True),
-#             pl.col("prediction").fill_null(False),
-#         )
-#         .with_columns(
-#             pl.col(set(df.columns) - {"prediction", "missing_data"}).forward_fill()
-#         )
-#         .collect()
-#         .rechunk()
-#         .set_sorted(["object_id", "lane", "epoch_time"])
-#         .lazy()
-#     )
-
-#     return test
 
 
 @lazify

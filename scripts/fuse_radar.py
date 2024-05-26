@@ -26,12 +26,12 @@ from src.filters.fusion import batch_join, rts_smooth  # noqa: E402
 from src.geometry import RoadNetwork  # noqa: E402
 from src.utils import check_gpu_available  # noqa: E402
 from src.pipelines.kalman_filter import (  # noqa: E402
+    filter_short_trajectories,
     join_results,
     prepare_frenet_measurement,
     build_extension,
     add_timedelta,
     build_kalman_id,
-    filter_short_trajectories,
     build_kalman_df,
 )
 from src.filters.vectorized_kalman import batch_imm_df  # noqa: E402
@@ -46,12 +46,35 @@ from src.pipelines.association import (  # noqa: E402
     pipe_gate_headway_calc,
     build_match_df as build_match_pipeline,
     calculate_match_indexes,
-    walk_graph_removals,
 )
+from src.pipelines.graph import walk_graph_removals  # noqa: E402
 from src.pipelines.lane_classification import label_lanes_tree  # noqa: E402
 from src.radar import CalibratedRadar  # noqa: E402
+from src.filters.lowpass import butter_lowpass_filter_plot  # noqa: E402
 
 GPU = check_gpu_available()
+
+
+def _list_converter(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_columns(
+        pl.col(df.columns[i]).arr.to_list()
+        for i, dtype in enumerate(df.dtypes)
+        if "Array" in str(dtype)
+    )
+
+
+def _array_converter(df: pl.DataFrame):
+    df = df.lazy()
+    list_cols = []
+    for col, dtype in zip(df.columns, df.dtypes):
+        if "List" in str(dtype):
+            list_cols.append(col)
+
+    lens = df.select(pl.col(list_cols).list.len().first()).fetch(1)
+
+    return df.with_columns(
+        pl.col(col).list.to_array(width=lens[col][0]) for col in list_cols
+    )
 
 
 def cache_wrapper(output_name_arg):
@@ -68,10 +91,11 @@ def cache_wrapper(output_name_arg):
             output_path = os.path.join(cache_dir, output_file)
 
             if os.path.exists(output_path):
-                return pl.read_parquet(output_path)
+                return pl.scan_parquet(output_path).pipe(_array_converter).collect()
 
             result = func(*args, **kwargs)
-            pl.DataFrame(result).write_parquet(output_path)
+            assert isinstance(result, pl.DataFrame)
+            result.lazy().pipe(_list_converter).collect().write_parquet(output_path)
 
             return result
 
@@ -80,7 +104,7 @@ def cache_wrapper(output_name_arg):
     return decorator
 
 
-def create_helper_objs():
+def create_helper_objs(calibration_yaml: str):
     mainline_net = RoadNetwork(
         lane_gdf=gpd.read_file(ROOT / "data/mainline_lanes.geojson"),
         keep_lanes=["EBL1", "WBL1"],
@@ -94,7 +118,7 @@ def create_helper_objs():
     )
 
     radar_obj = CalibratedRadar(
-        radar_location_path=ROOT / "configuration" / "march_calibrated.yaml",
+        radar_location_path=calibration_yaml,
     )
     return mainline_net, full_net, radar_obj
 
@@ -108,6 +132,10 @@ def open_radar_data(
         .with_columns(
             pl.col("epoch_time").dt.replace_time_zone("UTC").dt.round("100ms"),
         )
+        # .filter(
+        #     (pl.col("epoch_time").dt.hour() == 14)
+        #     & (pl.col("epoch_time").dt.day() == 13)
+        # )
         .pipe(radar_obj.create_object_id)
         # sort by object_id and epoch_time
         .sort(by=["object_id", "epoch_time"])
@@ -115,8 +143,8 @@ def open_radar_data(
         # filter out vehicles that don't trave some minimum distance (takes care of radar noise)
         .pipe(
             radar_obj.filter_short_trajectories,
-            minimum_distance_m=5,
-            minimum_duration_s=2,
+            minimum_distance_m=2,
+            minimum_duration_s=1,
         )
         # clip the end of trajectories where the velocity is constant
         .pipe(radar_obj.clip_trajectory_end)
@@ -208,13 +236,18 @@ def imm_filter(
     return (
         join_results(filt_df, filter_df, radar_df)
         .lazy()
+        .pipe(
+            add_front_back_s,
+            use_global_mean=True,
+        )
         .sort("epoch_time")
+        .set_sorted(["epoch_time"])
         .collect(streaming=True)
         .rechunk()
     )
 
 
-@cache_wrapper("lf_df")
+# @cache_wrapper("lf_df")
 def build_lf_df(
     joined_df: pl.DataFrame,
     mainline_net: RoadNetwork,
@@ -229,19 +262,16 @@ def build_lf_df(
             s_col="s",
         )
         .lazy()
-        .pipe(
-            add_front_back_s,
-            use_global_median=True,
-        )
         .sort(by=["epoch_time"])
         .set_sorted(["epoch_time"])
         .lazy()
         .pipe(
-            build_leader_follower_no_sort,
+            build_leader_follower_entire_history_df,
             s_col="s",
             use_lane_index=True,
-            max_s_gap=0.5 * 25,  # max headway of 0.5 seconds at 25 m/s
+            max_s_gap=0.5 * 35,  # max headway of 0.5 seconds at 25 m/s
         )
+        .filter((pl.col("s_velocity") > 0.5) & (pl.col("s_velocity_leader") > 0.5))
         .filter(pl.col("lane_index") <= 1)
         .collect(streaming=True)
     )
@@ -250,10 +280,7 @@ def build_lf_df(
 def build_assoc_liklihood_distance(
     lf_df,
 ) -> pl.DataFrame:
-
-    dims = 4
-
-    return lf_df.pipe(calc_assoc_liklihood_distance, gpu=GPU, dims=dims, permute=False)
+    return lf_df.pipe(calc_assoc_liklihood_distance, gpu=GPU, dims=4, permute=False)
 
 
 @cache_wrapper("match_df")
@@ -265,7 +292,9 @@ def build_match_df(
     return (
         lf_df
         # is this really necessary? Just filters the match for a certain tome
-        .pipe(calculate_match_indexes, min_time_threshold=1)
+        .pipe(
+            calculate_match_indexes,
+        )
         .pipe(
             pipe_gate_headway_calc,
             window=20,  # this is two seconds
@@ -280,13 +309,12 @@ def build_match_df(
             .lazy(),
             assoc_cutoff=assoc_cutoff,
             assoc_cutoff_pred=assoc_cutoff,
-            time_headway_cutoff=0.01,
         )
         .collect(streaming=True)
     )
 
 
-def _get_ordered_combinations(cc_list, cc):
+def _get_ordered_combinations(cc):
     return [
         (int(start), int(end), veh_i) if start < end else (end, start, veh_i)
         for veh_i, cc_list in enumerate(cc)
@@ -298,6 +326,8 @@ def _get_ordered_combinations(cc_list, cc):
 def build_graph(
     joined_df: pl.DataFrame, match_df: pl.DataFrame, cutoff: float = None
 ) -> pl.DataFrame:
+    if "Arr" in str(match_df["pair"].dtype):
+        match_df = match_df.with_columns(pl.col("pair").arr.to_list())
 
     # create the naive graph
     cc, G, assoc_df = joined_df.pipe(
@@ -410,7 +440,7 @@ def build_graph(
             )
         )
         .collect()
-        .pipe(calc_assoc_liklihood_distance, gpu=GPU, dims=4, permute=False)
+        .pipe(calc_assoc_liklihood_distance, gpu=GPU, dims=4, permute=False, maha=False)
         .lazy()
         .with_columns(
             pl.col("association_distance")
@@ -455,8 +485,6 @@ def build_graph(
                 cropped_G.subgraph(cc[veh]).copy(),
                 max_removals=20,
                 cutoff=chi2.ppf(0.999, 4),
-                # score_func=lambda y: 0.1
-                # df=permute_df.filter(pl.col("vehicle_index") == veh),
                 big_G=big_G,
             )
         )
@@ -473,28 +501,6 @@ def _build_fusion_df(assoc_df: pl.DataFrame, prediction_length: float) -> pl.Dat
     return assoc_df.pipe(
         build_fusion_df, prediction_length=prediction_length, max_vehicle_num=3
     ).collect(streaming=True)
-
-
-def _list_converter(df: pl.DataFrame) -> pl.DataFrame:
-    return df.with_columns(
-        pl.col(df.columns[i]).arr.to_list()
-        for i, dtype in enumerate(df.dtypes)
-        if "Array" in str(dtype)
-    )
-
-
-def _array_converter(df: pl.DataFrame):
-    df = df.lazy()
-    list_cols = []
-    for col, dtype in zip(df.columns, df.dtypes):
-        if "List" in str(dtype):
-            list_cols.append(col)
-
-    lens = df.select(pl.col(list_cols).list.len().first()).fetch(1)
-
-    return df.with_columns(
-        pl.col(col).list.to_array(width=lens[col][0]) for col in list_cols
-    ).collect()
 
 
 @cache_wrapper("info_df")
@@ -579,17 +585,12 @@ def _build_info_df(
 @cache_wrapper("fused_df")
 def fuse_df(fusion_df: pl.DataFrame) -> pl.DataFrame:
 
-    return (
-        batch_join(
-            fusion_df,
-            method="ImprovedFastCI",
-            batch_size=10_000 if not GPU else 3_000,
-            gpu=GPU,
-            s_col="s",
-        )
-        .lazy()
-        .pipe(_list_converter)
-        .collect()
+    return batch_join(
+        fusion_df,
+        method="ImprovedFastCI",
+        batch_size=10_000 if not GPU else 3_000,
+        gpu=GPU,
+        s_col="s",
     )
 
 
@@ -598,7 +599,7 @@ def smooth_df(
 ) -> pl.DataFrame:
 
     return rts_smooth(
-        fused_df.lazy().pipe(_array_converter).collect(),
+        fused_df,
         batch_size=10_000 if not GPU else 10_000,
         gpu=GPU,
         s_col="s",
@@ -711,8 +712,94 @@ def augment_merged_df(
     )
 
 
+def add_lane_info(
+    merged_df: pl.DataFrame,
+    mainline_net: RoadNetwork,
+) -> pl.DataFrame:
+
+    transformations = [
+        ("front_s_smooth", "d_smooth", "front_x_smooth", "front_y_smooth"),
+        ("back_s_smooth", "d_smooth", "back_x_smooth", "back_y_smooth"),
+        ("s_smooth", "d_smooth", "centroid_x_smooth", "centroid_y_smooth"),
+        ("ci_front_s", "ci_d", "ci_front_x", "ci_front_y"),
+        ("ci_back_s", "ci_d", "ci_back_x", "ci_back_y"),
+        ("ci_s", "ci_d", "ci_centroid_x", "ci_centroid_y"),
+    ]
+
+    for s_col, d_col, x_col, y_col in transformations:
+        merged_df = (
+            merged_df.drop([x_col, y_col])
+            .pipe(
+                mainline_net.frenet2xy,
+                lane_col="lane",
+                s_col=s_col,
+                d_col=d_col,
+            )
+            .drop(["s", "angle"])
+            .rename({"x_lane_point": x_col, "y_lane_point": y_col})
+        )
+
+    return merged_df
+
+
+def build_small_df(merged_df: pl.DataFrame, full_net: RoadNetwork) -> pl.DataFrame:
+    return (
+        merged_df.drop(["x_lane", "y_lane", "lane"])
+        .filter(pl.col("front_x_smooth").is_not_nan())
+        .pipe(
+            full_net.map_to_lane, utm_x_col="front_x_smooth", utm_y_col="front_y_smooth"
+        )
+        .rename({"name": "lane"})
+        .filter(
+            pl.col("lane").is_not_null() & pl.col("s_velocity_smooth").is_not_null()
+        )
+        .pipe(CalibratedRadar.add_cst_timezone)
+        .select(
+            [
+                pl.col("epoch_time_cst").alias("epoch_time"),
+                "s_smooth",
+                "length_s",
+                "s_velocity_smooth",
+                "s_accel_smooth",
+                "vehicle_id",
+                "lane",
+                "x_lane",
+                "y_lane",
+                pl.col("association_distance").mean().over("vehicle_id"),
+                pl.col("object_id").list.len().max().over("vehicle_id"),
+                (
+                    (
+                        pl.col("epoch_time") - pl.col("epoch_time").min()
+                    ).dt.total_milliseconds()
+                    / 1000
+                )
+                .over("vehicle_id")
+                .alias("vehicle_time"),
+            ]
+        )
+        .with_columns(pl.col(pl.FLOAT_DTYPES).cast(pl.Float32))
+        .filter((pl.col("vehicle_time").max().over("vehicle_id") > 5))
+        .sort("epoch_time")
+    )
+
+
+# def apply_lowpass_filter(
+#     df: pl.DataFrame,
+# ) -> pl.DataFrame:
+#     return df.pipe(
+#         butter_lowpass_filter_plot, "s_velocity_smooth", "vehicle_id"
+#     ).with_columns(
+#         (pl.col("s_velocity_smooth_lowpass").diff() / pl.col("vehicle_time").diff())
+#         .backward_fill(1)
+#         .over("vehicle_id")
+#         .alias("lowpass_accel")
+#     )
+
+
 @click.command()
 @click.argument("raw_data_path", type=click.Path())
+@click.argument("output_path", type=click.Path())
+@click.argument("calibration_yaml", type=click.Path())
 @click.option(
     "--prediction_length",
     default=4,
@@ -720,15 +807,31 @@ def augment_merged_df(
 )
 @click.option(
     "--cache-dir",
-    default=os.environ.get('CACHE_DIR'),
+    default=os.environ.get("CACHE_DIR"),
     help="The prediction length in seconds",
 )
-def run(raw_data_path, prediction_length, cache_dir):
+@click.option(
+    "--lowpass-filter",
+    default=False,
+    help="Whether to apply a lowpass filter to the data",
+    is_flag=True,
+)
+def run(
+    raw_data_path,
+    output_path,
+    calibration_yaml,
+    prediction_length,
+    cache_dir,
+    lowpass_filter,
+):
 
     if cache_dir is not None:
         os.environ["CACHE_DIR"] = cache_dir
 
-    mainline_net, full_net, radar_obj = create_helper_objs()
+    if lowpass_filter:
+        raise NotImplementedError("Lowpass filter is not implemented")
+
+    mainline_net, full_net, radar_obj = create_helper_objs(calibration_yaml)
 
     radar_df = build_radar_df(
         open_radar_data(
@@ -764,9 +867,7 @@ def run(raw_data_path, prediction_length, cache_dir):
         prediction_length=4,
     )
 
-    smoothed_df = smooth_df(
-        fuse_df(fusion_df)
-    )
+    smoothed_df = smooth_df(fuse_df(fusion_df))
 
     final_df = augment_merged_df(
         smoothed_df,
@@ -775,7 +876,16 @@ def run(raw_data_path, prediction_length, cache_dir):
         full_net,
         mainline_net,
     )
-    
+
+    small_final_df = add_lane_info(final_df, mainline_net=mainline_net)
+    # if lowpass_filter:
+    #     small_final_df = apply_lowpass_filter(small_final_df)
+
+    small_final_df.pipe(radar_obj.add_cst_timezone).write_parquet(
+        output_path, use_pyarrow=True
+    )
+    # build_small_df(small_final_df, full_net=full_net)
+
 
 if __name__ == "__main__":
 
