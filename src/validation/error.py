@@ -175,12 +175,12 @@ def paired_df(
     raw_radar_df: pl.DataFrame,
     imm_filter_df: pl.DataFrame,
     good_matches: pl.DataFrame,
-    optimal_offset: float,
+    second_offset: float,
 ) -> pl.DataFrame:
-    veh_df.with_columns(
+    veh_df = veh_df.with_columns(
         (
             pl.col("gps_time").cast(radar_df["epoch_time"].dtype)
-            + timedelta(seconds=optimal_offset)
+            + timedelta(seconds=second_offset)
         ).alias("epoch_time"),
         pl.col("lane_index").cast(int),
         pl.col("x").alias("centroid_x"),
@@ -190,7 +190,6 @@ def paired_df(
     small_radar_df = radar_df.select(
         [
             "epoch_time",
-            "s_smooth",
             pl.col("^.*_smooth$"),
             pl.col("^ci_.*$"),
             pl.col("length_s").alias("length_s_smooth"),
@@ -208,6 +207,8 @@ def paired_df(
             "prediction",
         ]
     ).filter(pl.col("vehicle_id").is_in(good_matches["vehicle_id"].unique()))
+
+    small_radar_df = small_radar_df.drop(cs.contains("_P"))
 
     small_raw_df = raw_radar_df.select(
         [
@@ -234,30 +235,28 @@ def paired_df(
         ]
     ).filter(pl.col("vehicle_id").is_in(good_matches["vehicle_id"].unique()))
 
-    small_imm_df = (
-        imm_filter_df.select(
-            [
-                "epoch_time",
-                pl.col("centroid_s").alias("s"),
-                "front_s",
-                "back_s",
-                "s_velocity",
-                "d",
-                "d_velocity",
-                "object_id",
-                "vehicle_id",
-                "front_x",
-                "front_y",
-                "back_x",
-                "back_y",
-                pl.col("centroid_x").alias("centroid_x_imm"),
-                pl.col("centroid_y").alias("centroid_y_imm"),
-                ((pl.col("s_velocity") ** 2) + (pl.col("d_velocity") ** 2))
-                .sqrt()
-                .alias("speed_imm"),
-                (pl.col("front_s") - pl.col("back_s")).alias("length_s_imm"),
-            ]
-        ),
+    small_imm_df = imm_filter_df.select(
+        [
+            "epoch_time",
+            pl.col("centroid_s").alias("s"),
+            "front_s",
+            "back_s",
+            "s_velocity",
+            "d",
+            "d_velocity",
+            "object_id",
+            "vehicle_id",
+            "front_x",
+            "front_y",
+            "back_x",
+            "back_y",
+            pl.col("centroid_x").alias("centroid_x_imm"),
+            pl.col("centroid_y").alias("centroid_y_imm"),
+            ((pl.col("s_velocity") ** 2) + (pl.col("d_velocity") ** 2))
+            .sqrt()
+            .alias("speed_imm"),
+            (pl.col("front_s") - pl.col("back_s")).alias("length_s_imm"),
+        ]
     )
 
     return (
@@ -278,6 +277,25 @@ def paired_df(
             on=["epoch_time", "vehicle_id"],
             how="left",
             suffix="_imm",
+        )
+        .sort("epoch_time")
+        .with_columns(
+            pl.col("front_s")
+            .diff()
+            .sum()
+            .over(["sequence_id", "vehicle_id"])
+            .alias("merged_trajectory_length"),
+            pl.col("front_s")
+            .diff()
+            .sum()
+            .over(["sequence_id", "vehicle_id", "object_id"])
+            .alias("raw_trajectory_length"),
+            pl.col("front_s")
+            .filter(pl.col("object_id_imm").is_not_null())
+            .diff()
+            .sum()
+            .over(["sequence_id", "vehicle_id", "object_id_imm"])
+            .alias("imm_trajectory_length"),
         )
     )
 
@@ -382,7 +400,7 @@ def group_and_aggregate(
 
 def build_error_df(
     error_df,
-    smoothed_error_df,
+    groupby_col: str='method'
 ):
     # Calculate errors
     smoothed_pred_col_func = lambda col_suffix: f"{col_suffix}_smooth"  # noqa: E731
@@ -440,25 +458,49 @@ def build_error_df(
         groupby_cols=["sequence_id"],
     )
 
-    return pl.concat(
-        [
-            grouped_smooth_error_df.with_columns(
-                pl.lit("smooth").alias("method"),
-                pl.col(pl.FLOAT_DTYPES).cast(pl.Float64),
-            ),
-            grouped_ci_error_df.with_columns(
-                pl.lit("ci").alias("method"), pl.col(pl.FLOAT_DTYPES).cast(pl.Float64)
-            ),
-            grouped_raw_error_df.with_columns(
-                pl.lit("raw").alias("method"), pl.col(pl.FLOAT_DTYPES).cast(pl.Float64)
-            ),
-            grouped_imm_error_df.with_columns(
-                pl.lit("imm").alias("method"), pl.col(pl.FLOAT_DTYPES).cast(pl.Float64)
-            ),
-        ]
-    ).drop(
-        # "lane_index",
-        cs.by_name("^s_velocity_.*$"),
-        cs.by_name("^.*_ae$"),
-        cs.by_name("^.*_pearsonr$"),
+    return (
+        pl.concat(
+            [
+                grouped_smooth_error_df.with_columns(
+                    pl.lit("smooth").alias("method"),
+                    pl.col(pl.FLOAT_DTYPES).cast(pl.Float64),
+                ),
+                grouped_ci_error_df.with_columns(
+                    pl.lit("ci").alias("method"),
+                    pl.col(pl.FLOAT_DTYPES).cast(pl.Float64),
+                ),
+                grouped_raw_error_df.with_columns(
+                    pl.lit("raw").alias("method"),
+                    pl.col(pl.FLOAT_DTYPES).cast(pl.Float64),
+                ),
+                grouped_imm_error_df.with_columns(
+                    pl.lit("imm").alias("method"),
+                    pl.col(pl.FLOAT_DTYPES).cast(pl.Float64),
+                ),
+            ]
+        )
+        .drop(
+            # "lane_index",
+            cs.by_name("^s_velocity_.*$"),
+            cs.by_name("^.*_ae$"),
+            cs.by_name("^.*_pearsonr$"),
+        )
+        .drop(
+            cs.by_name("^.*_mse$"),
+            cs.by_name("^.*sequences.*$"),
+            "n_vehicles",
+            "n_vehicles_per_sequence",
+        )
+        .with_columns(
+            pl.col("average_coverage_percent") * 100,
+        )
+        .rename(
+            {
+                "s_rmse": "centroid_s_rmse",
+                "speed_rmse": "Speed_speed_rmse",
+                "d_rmse": "centroid_d_rmse",
+            }
+        )
+        .group_by(groupby_col)
+        .agg(pl.all().mean())
     )

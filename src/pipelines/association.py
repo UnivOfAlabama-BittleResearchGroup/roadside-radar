@@ -395,7 +395,7 @@ def build_leader_follower_no_sort(
             .with_columns(
                 (pl.col(f"{s_col}_leader") - pl.col(s_col)).alias("s_gap"),
             )
-            .collect()
+            # .collect(streaming=True)
         )
 
     exploded_df = pl.concat(unique_pairs).unique(

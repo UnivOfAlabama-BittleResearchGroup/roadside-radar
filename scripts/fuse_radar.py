@@ -39,7 +39,7 @@ from src.pipelines.association import (  # noqa: E402
     add_front_back_s,
     build_fusion_df,
     build_leader_follower_entire_history_df,
-    build_leader_follower_no_sort,
+    build_leader_follower_no_sort,  # noqa: F401
     calc_assoc_liklihood_distance,
     create_vehicle_ids,
     make_graph_based_ids,
@@ -50,9 +50,13 @@ from src.pipelines.association import (  # noqa: E402
 from src.pipelines.graph import walk_graph_removals  # noqa: E402
 from src.pipelines.lane_classification import label_lanes_tree  # noqa: E402
 from src.radar import CalibratedRadar  # noqa: E402
-from src.filters.lowpass import butter_lowpass_filter_plot  # noqa: E402
+
+# from src.filters.lowpass import butter_lowpass_filter_plot  # noqa: E402
 
 GPU = check_gpu_available()
+
+IMM_M = np.array([[0.8, 0.1, 0.1], [0.1, 0.8, 0.1], [0.1, 0.1, 0.8]])
+IMM_MU = np.array([0.1, 0.1, 0.8])
 
 
 def _list_converter(df: pl.DataFrame) -> pl.DataFrame:
@@ -104,7 +108,16 @@ def cache_wrapper(output_name_arg):
     return decorator
 
 
-def create_helper_objs(calibration_yaml: str):
+def create_helper_objs(calibration_yaml: str) -> tuple:
+    """
+    Create the helper objects for the pipeline. This includes the mainline and full road network objects, and the radar object.
+
+    Args:
+        calibration_yaml (str): The path to the calibration yaml file, which specifies the radar location and rotation angles
+
+    Returns:
+        tuple: A tuple containing the mainline network, full network, and radar object
+    """
     mainline_net = RoadNetwork(
         lane_gdf=gpd.read_file(ROOT / "data/mainline_lanes.geojson"),
         keep_lanes=["EBL1", "WBL1"],
@@ -127,6 +140,28 @@ def create_helper_objs(calibration_yaml: str):
 def open_radar_data(
     path: str, radar_obj: CalibratedRadar, mainline_net: RoadNetwork
 ) -> pl.DataFrame:
+    """
+    Open the radar data and perform the necessary preprocessing steps to prepare the data for the pipeline.
+
+    Args:
+        path (str): The path to the radar data. Can be a single file or a glob pattern
+        radar_obj (CalibratedRadar): The radar object, which contains the calibration information
+        mainline_net (RoadNetwork): The mainline network object, which contains the lane information
+
+    Returns:
+        pl.DataFrame: The preprocessed radar data
+    """
+
+    def dist_filter(df: pl.DataFrame) -> pl.DataFrame:
+        return df.filter(
+            pl.when(
+                pl.col("ip").is_in(["10.160.7.141", "10.160.7.137"])
+                & (pl.col("epoch_time").dt.month() == 10)
+            )
+            .then(pl.col("dist") < 300)
+            .otherwise(pl.lit(True))
+        )
+
     return (
         pl.scan_parquet(path)
         .with_columns(
@@ -141,6 +176,7 @@ def open_radar_data(
         .sort(by=["object_id", "epoch_time"])
         .set_sorted(["object_id", "epoch_time"])
         # filter out vehicles that don't trave some minimum distance (takes care of radar noise)
+        # This happens when the radar tracks things like the opposite signal pole or signs
         .pipe(
             radar_obj.filter_short_trajectories,
             minimum_distance_m=2,
@@ -148,10 +184,9 @@ def open_radar_data(
         )
         # clip the end of trajectories where the velocity is constant
         .pipe(radar_obj.clip_trajectory_end)
-        # resample to 10 Hz
         .pipe(radar_obj.resample, 100)
         .pipe(radar_obj.set_timezone, timezone_="UTC")
-        .pipe(radar_obj.add_cst_timezone)
+        # .pipe(radar_obj.add_cst_timezone)
         .pipe(radar_obj.add_heading)
         .pipe(radar_obj.rotate_radars)
         .pipe(radar_obj.update_origin)
@@ -160,6 +195,9 @@ def open_radar_data(
             .sqrt()
             .alias("dist"),
         )
+        # filter out the radar data that is far away from the problem radar heads
+        .pipe(dist_filter)
+        # mark whethter the vehicle is approaching the radar head or not
         .with_columns(
             (pl.col("dist").diff().backward_fill(1).over("object_id") < 0).alias(
                 "approaching"
@@ -169,6 +207,7 @@ def open_radar_data(
         .sort(by=["epoch_time"])
         .set_sorted(["epoch_time"])
         .collect(streaming=True)
+        # map to the lanes
         .pipe(
             mainline_net.map_to_lane,
             dist_upper_bound=mainline_net.LANE_WIDTH * mainline_net.LANE_NUM
@@ -193,6 +232,19 @@ def build_radar_df(
     minimum_distance_m: float = 5,
     minimum_duration_s: float = 2,
 ) -> pl.DataFrame:
+    """
+    Function to pre-process the radar dataframe for the IMM filtering.
+
+    Args:
+        raw_radar_df (pl.DataFrame): The raw radar dataframe. Should be the output of the `open_radar_data` function
+        prediction_length (float): The prediction length in seconds
+        minimum_distance_m (float, optional): The minimum distance that a trajectory has to travel to be considered valid. Defaults to 5m.
+        minimum_duration_s (float, optional): The minimum duration that a trajectory has to last to be considered valid. Defaults to 2s.
+
+    Returns:
+        pl.DataFrame: The preprocessed radar dataframe, ready for the IMM filtering
+    """
+
     return (
         raw_radar_df.pipe(add_timedelta, vehicle_id_col=["object_id", "lane"])
         .pipe(build_kalman_id, split_time_delta=prediction_length + 0.1)
@@ -212,13 +264,20 @@ def build_radar_df(
 def imm_filter(
     radar_df: pl.DataFrame,
 ) -> pl.DataFrame:
+    """
+    Function to apply the IMM filter to the radar dataframe
+
+    Args:
+        radar_df (pl.DataFrame): The radar dataframe. Should be the output of the `build_radar_df` function
+
+    Returns:
+        pl.DataFrame: The filtered radar dataframe
+    """
     filter_df = (
-        radar_df
-        # .with_columns((pl.col("distanceToFront_s") + pl.col("s")).alias("front_s"))
-        .pipe(build_kalman_df, s_col="s", derive_s_vel=False)
+        radar_df.pipe(build_kalman_df, s_col="s", derive_s_vel=False)
         .filter(
             pl.col("max_time")
-            < pl.col("max_time").max()  # filter out the outlier times
+            < pl.col("max_time").max()  # filter out the outlier times. This is a hack
         )
         .collect()
     )
@@ -226,9 +285,8 @@ def imm_filter(
     filt_df = batch_imm_df(
         filter_df.rename({"measurement": "z"}),
         filters=("CALC", "CALK", "CVLK"),
-        M=np.array([[0.8, 0.1, 0.1], [0.1, 0.8, 0.1], [0.1, 0.1, 0.8]]),
-        mu=np.array([0.1, 0.1, 0.8]),
-        # chunk_size=3_500,
+        M=IMM_M,
+        mu=IMM_MU,
         chunk_size=100_000 if not GPU else 9_000 * 1000,
         gpu=GPU,
     )
@@ -253,6 +311,19 @@ def build_lf_df(
     mainline_net: RoadNetwork,
     full_net: RoadNetwork,
 ) -> pl.DataFrame:
+    """
+    This function constructs the leader-follower dataframe. Vehices must have been leaders and followers at some point in time to be considered for associtation.
+
+    It first labels the lanes, then builds the leader-follower dataframe, and filters out the vehicles that are not in the mainline lanes.
+
+    Args:
+        joined_df (pl.DataFrame): _description_
+        mainline_net (RoadNetwork): _description_
+        full_net (RoadNetwork): _description_
+
+    Returns:
+        pl.DataFrame: _description_
+    """
     return (
         joined_df.pipe(
             label_lanes_tree,
@@ -267,11 +338,13 @@ def build_lf_df(
         .lazy()
         .pipe(
             build_leader_follower_entire_history_df,
+            # build_leader_follower_no_sort,
             s_col="s",
             use_lane_index=True,
-            max_s_gap=0.5 * 35,  # max headway of 0.5 seconds at 25 m/s
+            max_s_gap=0.5 * 35,  # max headway of 0.5 seconds at 35 m/s
         )
-        .filter((pl.col("s_velocity") > 0.5) & (pl.col("s_velocity_leader") > 0.5))
+        # only include vehicles that are in the mainline lanes and have a velocity greater than 0.5 m/s
+        # .filter((pl.col("s_velocity") > 0.5) & (pl.col("s_velocity_leader") > 0.5))
         .filter(pl.col("lane_index") <= 1)
         .collect(streaming=True)
     )
@@ -450,10 +523,6 @@ def build_graph(
         .group_by("pair_hash")
         .agg(
             pl.col("association_distance").mean().alias("association_distance_filt"),
-            pl.col("epoch_time")
-            .filter(pl.col("association_distance") < cutoff)
-            .first()
-            .alias("join_time"),
         )
         .collect()
     )
@@ -461,6 +530,10 @@ def build_graph(
     permute_df = permute_df.update(need2compute, on="pair_hash", how="left").filter(
         pl.col("association_distance_filt").is_not_null()
     )
+
+    # permute_df.write_parquet(
+    #     "tmp/permute_df.parquet", use_pyarrow=True,
+    # )
 
     big_G = nx.Graph()
 
@@ -479,7 +552,6 @@ def build_graph(
     remove_edges = []
 
     for veh in tqdm(permute_df["vehicle_index"].unique()):
-
         remove_edges.extend(
             walk_graph_removals(
                 cropped_G.subgraph(cc[veh]).copy(),
@@ -507,7 +579,6 @@ def _build_fusion_df(assoc_df: pl.DataFrame, prediction_length: float) -> pl.Dat
 def _build_info_df(
     fusion_df: pl.DataFrame,
 ):
-
     outer_df = (
         fusion_df.select(
             [
@@ -584,7 +655,6 @@ def _build_info_df(
 
 @cache_wrapper("fused_df")
 def fuse_df(fusion_df: pl.DataFrame) -> pl.DataFrame:
-
     return batch_join(
         fusion_df,
         method="ImprovedFastCI",
@@ -597,7 +667,6 @@ def fuse_df(fusion_df: pl.DataFrame) -> pl.DataFrame:
 def smooth_df(
     fused_df: pl.DataFrame,
 ) -> pl.DataFrame:
-
     return rts_smooth(
         fused_df,
         batch_size=10_000 if not GPU else 10_000,
@@ -613,7 +682,6 @@ def augment_merged_df(
     full_net: RoadNetwork,
     mainline_net: RoadNetwork,
 ) -> None:
-
     prediction_tracker = (
         fusion_df.select(
             [
@@ -716,7 +784,6 @@ def add_lane_info(
     merged_df: pl.DataFrame,
     mainline_net: RoadNetwork,
 ) -> pl.DataFrame:
-
     transformations = [
         ("front_s_smooth", "d_smooth", "front_x_smooth", "front_y_smooth"),
         ("back_s_smooth", "d_smooth", "back_x_smooth", "back_y_smooth"),
@@ -824,7 +891,6 @@ def run(
     cache_dir,
     lowpass_filter,
 ):
-
     if cache_dir is not None:
         os.environ["CACHE_DIR"] = cache_dir
 
@@ -888,5 +954,4 @@ def run(
 
 
 if __name__ == "__main__":
-
     run()
