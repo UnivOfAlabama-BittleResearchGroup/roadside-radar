@@ -1,6 +1,4 @@
 # find the root of the project
-import os
-from pathlib import Path
 from typing import Tuple
 import numpy as np
 import polars as pl
@@ -10,7 +8,6 @@ from shapelysmooth import chaikin_smooth, taubin_smooth
 from scipy.spatial import KDTree
 from scipy.optimize import minimize
 
-from src.radar import CalibratedRadar
 
 
 def build_lane_df(lane_center_path: str) -> Tuple[gpd.GeoDataFrame, pl.DataFrame]:

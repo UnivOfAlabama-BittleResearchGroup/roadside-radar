@@ -58,6 +58,8 @@ GPU = check_gpu_available()
 IMM_M = np.array([[0.8, 0.1, 0.1], [0.1, 0.8, 0.1], [0.1, 0.1, 0.8]])
 IMM_MU = np.array([0.1, 0.1, 0.8])
 
+CACHE = True
+
 
 def _list_converter(df: pl.DataFrame) -> pl.DataFrame:
     return df.with_columns(
@@ -85,23 +87,26 @@ def cache_wrapper(output_name_arg):
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
-            cache_dir = os.environ.get("CACHE_DIR")
-            if cache_dir is None:
-                raise ValueError("Environment variable 'CACHE_DIR' is not set.")
+            if CACHE:
+                cache_dir = os.environ.get("CACHE_DIR")
+                if cache_dir is None:
+                    raise ValueError("Environment variable 'CACHE_DIR' is not set.")
 
-            output_name = output_name_arg
+                output_name = output_name_arg
 
-            output_file = f"{func.__name__}_{output_name}.parquet"
-            output_path = os.path.join(cache_dir, output_file)
+                output_file = f"{func.__name__}_{output_name}.parquet"
+                output_path = os.path.join(cache_dir, output_file)
 
-            if os.path.exists(output_path):
-                return pl.scan_parquet(output_path).pipe(_array_converter).collect()
+                if os.path.exists(output_path):
+                    return pl.scan_parquet(output_path).pipe(_array_converter).collect()
 
-            result = func(*args, **kwargs)
-            assert isinstance(result, pl.DataFrame)
-            result.lazy().pipe(_list_converter).collect().write_parquet(output_path)
+                result = func(*args, **kwargs)
+                assert isinstance(result, pl.DataFrame)
+                result.lazy().pipe(_list_converter).collect().write_parquet(output_path)
 
-            return result
+                return result
+            else:
+                return func(*args, **kwargs)
 
         return wrapper
 
@@ -136,9 +141,46 @@ def create_helper_objs(calibration_yaml: str) -> tuple:
     return mainline_net, full_net, radar_obj
 
 
+# def _sql_filter(df: pl.LazyFrame, sql: str = None) -> pl.LazyFrame:
+
+#     if sql is not None:
+#         import duckdb
+
+#         # duckdb works a lot better than polars with SQL queries
+#         return duckdb.sql(
+#             """
+#         SELECT * FROM df WHERE {}
+#         """.format(
+#                 sql
+#             )
+#         ).pl().lazy()
+
+#     return df
+
+
+def _build_small_df(df: pl.LazyFrame, build_small: bool) -> pl.LazyFrame:
+    if build_small:
+        df = df.filter(
+            (pl.col("epoch_time").dt.day() == 13)
+            & (pl.col("epoch_time").dt.hour() == 12)
+        )
+
+        # save the small raw radar data. This is harcoded path b.c. lazy
+        df.collect().write_parquet(
+            "tmp/raw_radar_small.parquet", 
+            use_pyarrow=True,
+            compression_level=22
+        )
+
+    return df
+
+
 @cache_wrapper("raw_radar_df")
 def open_radar_data(
-    path: str, radar_obj: CalibratedRadar, mainline_net: RoadNetwork
+    path: str,
+    radar_obj: CalibratedRadar,
+    mainline_net: RoadNetwork,
+    build_small_df: str = None,
 ) -> pl.DataFrame:
     """
     Open the radar data and perform the necessary preprocessing steps to prepare the data for the pipeline.
@@ -147,6 +189,7 @@ def open_radar_data(
         path (str): The path to the radar data. Can be a single file or a glob pattern
         radar_obj (CalibratedRadar): The radar object, which contains the calibration information
         mainline_net (RoadNetwork): The mainline network object, which contains the lane information
+        sql (str, optional): A SQL filter to apply to the data. Defaults to None.
 
     Returns:
         pl.DataFrame: The preprocessed radar data
@@ -158,20 +201,17 @@ def open_radar_data(
                 pl.col("ip").is_in(["10.160.7.141", "10.160.7.137"])
                 & (pl.col("epoch_time").dt.month() == 10)
             )
-            .then(pl.col("dist") < 300)
+            .then(pl.col("dist") < 275)
             .otherwise(pl.lit(True))
         )
 
     return (
         pl.scan_parquet(path)
-        .with_columns(
-            pl.col("epoch_time").dt.replace_time_zone("UTC").dt.round("100ms"),
-        )
-        # .filter(
-        #     (pl.col("epoch_time").dt.hour() == 14)
-        #     & (pl.col("epoch_time").dt.day() == 13)
+        # .with_columns(
+        #     pl.col("epoch_time").dt.replace_time_zone("UTC").dt.round("100ms"),
         # )
         .pipe(radar_obj.create_object_id)
+        .pipe(_build_small_df, build_small=build_small_df)
         # sort by object_id and epoch_time
         .sort(by=["object_id", "epoch_time"])
         .set_sorted(["object_id", "epoch_time"])
@@ -883,6 +923,18 @@ def build_small_df(merged_df: pl.DataFrame, full_net: RoadNetwork) -> pl.DataFra
     help="Whether to apply a lowpass filter to the data",
     is_flag=True,
 )
+@click.option(
+    "--no-cache",
+    default=False,
+    help="Turn caching off",
+    is_flag=True,
+)
+@click.option(
+    "--build-small",
+    default=False,
+    help="Build small dataframe",
+    is_flag=True,
+)
 def run(
     raw_data_path,
     output_path,
@@ -890,12 +942,17 @@ def run(
     prediction_length,
     cache_dir,
     lowpass_filter,
+    no_cache,
+    build_small,
 ):
     if cache_dir is not None:
         os.environ["CACHE_DIR"] = cache_dir
 
     if lowpass_filter:
         raise NotImplementedError("Lowpass filter is not implemented")
+
+    global CACHE
+    CACHE = not no_cache
 
     mainline_net, full_net, radar_obj = create_helper_objs(calibration_yaml)
 
@@ -904,6 +961,7 @@ def run(
             raw_data_path,
             radar_obj=radar_obj,
             mainline_net=mainline_net,
+            build_small_df=build_small,
         ),
         prediction_length=prediction_length,
     )
@@ -946,11 +1004,19 @@ def run(
     small_final_df = add_lane_info(final_df, mainline_net=mainline_net)
     # if lowpass_filter:
     #     small_final_df = apply_lowpass_filter(small_final_df)
+    if build_small:
+        # fit this inside GitHub's 100mb restriction
+        import polars.selectors as cs
 
-    small_final_df.pipe(radar_obj.add_cst_timezone).write_parquet(
-        output_path, use_pyarrow=True
-    )
-    # build_small_df(small_final_df, full_net=full_net)
+        small_final_df.drop(cs.contains("ci")).drop(
+            cs.contains("index"), "vehicle_id_int"
+        ).with_columns(pl.col(cs.FLOAT_DTYPES).cast(pl.Float32)).write_parquet(
+            output_path, use_pyarrow=True
+        )
+    else:
+        small_final_df.pipe(radar_obj.add_cst_timezone).write_parquet(
+            output_path, use_pyarrow=True
+        )
 
 
 if __name__ == "__main__":

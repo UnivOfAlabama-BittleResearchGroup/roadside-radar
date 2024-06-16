@@ -152,3 +152,84 @@ def plot_graph(
     nx.draw_networkx_edge_labels(bad_edges, pos, bad_labels, font_size=10, ax=ax)
     return {v: i for v, (i, *_) in node_color_mapper.items()}
     # plt.title(f"Vehicle {veh_id} Graph")
+
+
+def letter_subplots(axes=None, letters=None, xoffset=-0.1, yoffset=1.0, **kwargs):
+    # directly from https://gist.github.com/bagrow/e3fd0bcfb7e107c0471d657b98ffc19d
+    """Add letters to the corners of subplots (panels). By default each axis is
+    given an uppercase bold letter label placed in the upper-left corner.
+    Args
+        axes : list of pyplot ax objects. default plt.gcf().axes.
+        letters : list of strings to use as labels, default ["A", "B", "C", ...]
+        xoffset, yoffset : positions of each label relative to plot frame
+          (default -0.1,1.0 = upper left margin). Can also be a list of
+          offsets, in which case it should be the same length as the number of
+          axes.
+        Other keyword arguments will be passed to annotate() when panel letters
+        are added.
+    Returns:
+        list of strings for each label added to the axes
+    Examples:
+        Defaults:
+            >>> fig, axes = plt.subplots(1,3)
+            >>> letter_subplots() # boldfaced A, B, C
+        
+        Common labeling schemes inferred from the first letter:
+            >>> fig, axes = plt.subplots(1,4)        
+            >>> letter_subplots(letters='(a)') # panels labeled (a), (b), (c), (d)
+        Fully custom lettering:
+            >>> fig, axes = plt.subplots(2,1)
+            >>> letter_subplots(axes, letters=['(a.1)', '(b.2)'], fontweight='normal')
+        Per-axis offsets:
+            >>> fig, axes = plt.subplots(1,2)
+            >>> letter_subplots(axes, xoffset=[-0.1, -0.15])
+            
+        Matrix of axes:
+            >>> fig, axes = plt.subplots(2,2, sharex=True, sharey=True)
+            >>> letter_subplots(fig.axes) # fig.axes is a list when axes is a 2x2 matrix
+    """
+
+    # get axes:
+    if axes is None:
+        axes = plt.gcf().axes
+    # handle single axes:
+    try:
+        iter(axes)
+    except TypeError:
+        axes = [axes]
+
+    # set up letter defaults (and corresponding fontweight):
+    fontweight = "bold"
+    ulets = list('ABCDEFGHIJKLMNOPQRSTUVWXYZ'[:len(axes)])
+    llets = list('abcdefghijklmnopqrstuvwxyz'[:len(axes)])
+    if letters is None or letters == "A":
+        letters = ulets
+    elif letters == "(a)":
+        letters = [ "({})".format(lett) for lett in llets ]
+        fontweight = "normal"
+    elif letters == "(A)":
+        letters = [ "({})".format(lett) for lett in ulets ]
+        fontweight = "normal"
+    elif letters in ("lower", "lowercase", "a"):
+        letters = llets
+
+    # make sure there are x and y offsets for each ax in axes:
+    if isinstance(xoffset, (int, float)):
+        xoffset = [xoffset]*len(axes)
+    else:
+        assert len(xoffset) == len(axes)
+    if isinstance(yoffset, (int, float)):
+        yoffset = [yoffset]*len(axes)
+    else:
+        assert len(yoffset) == len(axes)
+
+    # defaults for annotate (kwargs is second so it can overwrite these defaults):
+    my_defaults = dict(fontweight=fontweight, fontsize='large', ha="center",
+                       va='center', xycoords='axes fraction', annotation_clip=False)
+    kwargs = dict( list(my_defaults.items()) + list(kwargs.items()))
+
+    list_txts = []
+    for ax,lbl,xoff,yoff in zip(axes,letters,xoffset,yoffset):
+        t = ax.annotate(lbl, xy=(xoff,yoff), **kwargs)
+        list_txts.append(t)
+    return list_txts
