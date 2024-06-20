@@ -890,19 +890,6 @@ def build_small_df(merged_df: pl.DataFrame, full_net: RoadNetwork) -> pl.DataFra
     )
 
 
-# def apply_lowpass_filter(
-#     df: pl.DataFrame,
-# ) -> pl.DataFrame:
-#     return df.pipe(
-#         butter_lowpass_filter_plot, "s_velocity_smooth", "vehicle_id"
-#     ).with_columns(
-#         (pl.col("s_velocity_smooth_lowpass").diff() / pl.col("vehicle_time").diff())
-#         .backward_fill(1)
-#         .over("vehicle_id")
-#         .alias("lowpass_accel")
-#     )
-
-
 @click.command()
 @click.argument("raw_data_path", type=click.Path())
 @click.argument("output_path", type=click.Path())
@@ -1008,7 +995,7 @@ def run(
         # fit this inside GitHub's 100mb restriction
         import polars.selectors as cs
 
-        small_final_df.drop(cs.contains("ci")).drop(
+        small_final_df.drop(cs.contains("ci_")).drop(
             cs.contains("index"), "vehicle_id_int"
         ).with_columns(pl.col(cs.FLOAT_DTYPES).cast(pl.Float32)).write_parquet(
             output_path, use_pyarrow=True
