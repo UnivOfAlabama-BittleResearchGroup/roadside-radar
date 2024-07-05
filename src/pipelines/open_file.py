@@ -65,7 +65,8 @@ def prep_df(
         df = df.lazy()
 
     return (
-        df.pipe(f.create_object_id)
+        df
+        .pipe(f.create_object_id)
         # sort by object_id and epoch_time
         .sort(by=["object_id", "epoch_time"])
         .set_sorted(["object_id", "epoch_time"])
@@ -75,7 +76,7 @@ def prep_df(
         # resample to 10 Hz
         .pipe(f.resample, 100)
         # # fix when the radar is outputs the same data for multiple frames
-        .pipe(f.fix_duplicate_positions)
+        # .pipe(f.fix_duplicate_positions)
         # clip the end of trajectories where the velocity is constant
         .pipe(f.set_timezone, timezone_="UTC")
         .pipe(f.add_cst_timezone)

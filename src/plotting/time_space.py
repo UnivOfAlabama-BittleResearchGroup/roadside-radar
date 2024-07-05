@@ -1,8 +1,5 @@
-from datetime import timedelta
-from plotly.subplots import make_subplots
 import plotly.graph_objects as go
 import plotly.express as px
-import polars as pl
 
 
 def plot_time_space(
@@ -32,7 +29,7 @@ def plot_time_space(
         def marker_func(x, i):
             return "circle"
 
-    plot_df_ts = plot_df.sort("epoch_time").to_pandas()
+    plot_df_ts = plot_df.sort("epoch_time_cst").to_pandas()
 
     if "prediction" not in plot_df_ts.columns:
         plot_df_ts["prediction"] = False
@@ -48,11 +45,11 @@ def plot_time_space(
 
         # for obj_id, obj_df in veh_df.groupby(["object_id"]):
         
-        veh_df = veh_df.sort_values("epoch_time")
+        veh_df = veh_df.sort_values("epoch_time_cst")
         veh_df = veh_df.iloc[::every, :]
 
-        p_df = veh_df.loc[veh_df["prediction"] == True]
-        np_df = veh_df.loc[veh_df["prediction"] == False]
+        p_df = veh_df.loc[veh_df["prediction"]]
+        np_df = veh_df.loc[~veh_df["prediction"]]
 
         
 

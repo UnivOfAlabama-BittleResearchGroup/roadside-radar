@@ -1,10 +1,6 @@
-from typing import Dict
-import numpy as np
 import polars as pl
 from src.geometry import RoadNetwork
 from src.pipelines.utils import lazify, timeit
-import torch
-import pomegranate as pmg
 
 
 @lazify
@@ -39,26 +35,6 @@ def label_lane(
             .otherwise(None)
         )
         .alias("lane_index")
-        # .otherwise(
-        #     pl.when(
-        #         pl.col("d").is_between(
-        #             right_lane_center - half_lane_width,
-        #             right_lane_center + half_lane_width,
-        #         )
-        #     )
-        #     .then(0)
-        #     .otherwise(
-        #         pl.when(
-        #             pl.col("d").is_between(
-        #                 left_lane_center_eb - half_lane_width,
-        #                 left_lane_center_eb + half_lane_width,
-        #             )
-        #         )
-        #         .then(1)
-        #         .otherwise(None)
-        #     )
-        # )
-        # .alias("lane_index")
     )
 
 
@@ -68,12 +44,9 @@ def label_lanes_tree(
     kalman_network: RoadNetwork,
     lane_width: float,
     s_col: str = "s",
+    d_col: str = 'd',
     time_col: str = "epoch_time",
 ) -> pl.DataFrame:
-
-
-
-
 
     return (
         df
@@ -109,14 +82,14 @@ def label_lanes_tree(
         )
         # .drop("s_lane", "name_lane")
         .with_columns(
-            pl.when(pl.col("d") < pl.col("d_cutoff"))
+            pl.when(pl.col(d_col) < pl.col("d_cutoff"))
             .then(
-                pl.when(pl.col("d") > (-1 * lane_width / 2))
+                pl.when(pl.col(d_col) > (-1 * lane_width / 2))
                 .then(pl.lit(0))
                 .otherwise(pl.col("lane_index"))
             )
             .otherwise(
-                pl.when(pl.col("d") < ((lane_width / 2) + pl.col("d_other_center")))
+                pl.when(pl.col(d_col) < ((lane_width / 2) + pl.col("d_other_center")))
                 .then(pl.lit(1))
                 .otherwise(pl.col("lane_index"))
             )

@@ -1,322 +1,15 @@
 import gc
 from typing import List, Union
-from itertools import permutations
 import numpy as np
 import torch
 import polars as pl
 from tqdm import tqdm
 import pyarrow as pa
-from scipy.stats import chi2
 
+from src.filters.metrics import build_h_matrix, build_r_matrix
 from src.filters.vectorized_kalman import (
-    build_h_matrix,
-    build_r_matrix,
-    CALKFilter,
-    CVLKFilter,
     CALCFilter,
-    pick_device,
-    gen_chunks,
 )
-
-
-# def create_z_matrices(df, Z_followers, Z_leaders):
-#     positions = ["s", "front_s", "back_s"]
-#     # Create all combinations of leader and follower positions
-#     for follower_pos, leader_pos in permutations(positions, 2):
-#         follower_col = [
-#             f"{follower_pos}",
-#             "s_velocity",
-#             "d",
-#             "d_velocity",
-#         ]
-#         leader_col = [
-#             f"{leader_pos}_leader",
-#             "s_velocity_leader",
-#             "d_leader",
-#             "d_velocity_leader",
-#         ]
-
-#         # Append follower data to Z_followers
-#         Z_followers.append(
-#             torch.from_numpy(
-#                 df[follower_col]
-#                 .to_numpy()
-#                 .copy()
-#                 .reshape(-1, 4, 1)
-#                 .astype(dtype=np.float32),
-#             )
-#         )
-
-#         # Append leader data to Z_leaders
-#         Z_leaders.append(
-#             torch.from_numpy(
-#                 df[leader_col]
-#                 .to_numpy()
-#                 .copy()
-#                 .reshape(-1, 4, 1)
-#                 .astype(dtype=np.float32),
-#             )
-#         )
-
-
-def create_z_matrices(df, Z_followers, Z_leaders, pos_override=None):
-    if pos_override is None:
-        pos_override = ["s", "front_s", "back_s"]
-    for pos in pos_override:
-        for ext, l in zip(["_leader", ""], [Z_leaders, Z_followers]):
-            l.append(
-                torch.from_numpy(
-                    df[
-                        [
-                            f"{pos}{ext}",
-                            f"s_velocity{ext}",
-                            f"d{ext}",
-                            f"d_velocity{ext}",
-                        ]
-                    ]
-                    .to_numpy()
-                    .copy()
-                    .reshape(-1, 4, 1)
-                    .astype(
-                        dtype=np.float32,
-                    ),
-                )
-            )
-
-
-def loglikelihood(
-    df: pl.DataFrame,
-    gpu: bool = True,
-) -> pl.DataFrame:
-    device = torch.device("cuda" if gpu and torch.cuda.is_available() else "cpu")
-
-    H = build_h_matrix().to(torch.float32).to(device)
-
-    R = build_r_matrix().to(torch.float32).to(device)
-
-    P_leader = torch.from_numpy(
-        df["P_leader"]
-        .to_numpy()
-        .copy()
-        .reshape(-1, 6, 6)
-        .astype(
-            dtype=np.float32,
-        )
-    ).to(device)
-
-    S_leader = H @ P_leader @ H.T + R
-
-    Z_followers = []
-    Z_leaders = []
-
-    create_z_matrices(df, Z_followers, Z_leaders)
-
-    Z_followers = torch.stack(Z_followers, dim=1).to(device)
-    Z_leaders = torch.stack(Z_leaders, dim=1).to(device)
-
-    _log2pi = torch.log(torch.tensor(2 * np.pi, dtype=torch.float32, device=device))
-
-    error = Z_followers - Z_leaders
-
-    vals, vecs = torch.linalg.eigh(S_leader)
-    logdet = torch.log(vals).sum(
-        axis=-1,
-    )
-    valsinv = 1 / vals
-    U = vecs * valsinv.sqrt().unsqueeze(-1)
-    rank = torch.linalg.matrix_rank(U)
-    maha = ((U[..., None, :, :] @ error).squeeze() ** 2).sum(axis=-1)
-    likelihood, _ = (-0.5 * (_log2pi * rank[..., None] + logdet[..., None] + maha)).max(
-        axis=-1
-    )
-    return df.with_columns(
-        [
-            pl.Series(likelihood.detach().cpu().numpy()).alias("loglikelihood"),
-        ]
-    )
-
-
-def association_loglikelihood_distance(
-    df: pl.DataFrame,
-    gpu: bool = True,
-    dims: int = 4,
-    # augment_length: bool = True,
-    length_cols: List[str] = ["length_s", "length_s_leader"],
-) -> pl.DataFrame:
-    device = pick_device(gpu)
-
-    H = build_h_matrix().to(device)
-    R = build_r_matrix(d_pos_error=1.38, pos_error=2).to(device)
-
-    P = torch.from_numpy(
-        df["P_leader"]
-        .to_numpy()
-        .copy()
-        .reshape(-1, 6, 6)
-        .astype(
-            dtype=np.float32,
-        )
-    ).to(device)
-
-    P += torch.from_numpy(
-        df["P"]
-        .to_numpy()
-        .copy()
-        .reshape(-1, 6, 6)
-        .astype(
-            dtype=np.float32,
-        )
-    ).to(device)
-
-    # if augment_length:
-    #     P[:, 0, 0] += torch.from_numpy(
-    #         df.with_columns(
-    #             [pl.lit(2.5).alias("length_s_fixed")],
-    #         )
-    #         .select(
-    #             *length_cols,
-    #             "length_s_fixed",
-    #         )
-    #         .max_horizontal()
-    #         .to_numpy(writable=True)
-    #         .ravel()
-    #         # / 2
-    #     ).to(device)
-
-    S = H @ P @ H.T + R
-    S = S[:, :dims, :dims]
-
-    Z_followers = []
-    Z_leaders = []
-
-    create_z_matrices(df, Z_followers, Z_leaders)
-
-    # find if any overlap in the z_positions
-
-    Z_followers = torch.stack(Z_followers, dim=1).to(device)[:, :, :dims]
-    Z_leaders = torch.stack(Z_leaders, dim=1).to(device)[:, :, :dims]
-
-    Z_error = Z_followers - Z_leaders
-
-    # s_overlap = (
-    #     torch.min(
-    #         Z_leaders[:, :, 0].max(axis=1)[0], Z_followers[:, :, 0].max(axis=1)[0]
-    #     )
-    #     - torch.max(
-    #         Z_leaders[:, :, 0].min(axis=1)[0], Z_followers[:, :, 0].min(axis=1)[0]
-    #     )
-    #     > 0
-    # ).any(axis=-1)
-
-    d = (
-        (
-            Z_error.transpose(-1, -2)
-            @ torch.linalg.pinv(S, hermitian=True)[..., None, :, :]
-            @ Z_error
-        ).squeeze()
-        + torch.logdet(S)[..., None]
-        # + dims * torch.log(torch.tensor(2 * np.pi, dtype=torch.float32, device=device))
-        # + two_pi
-    ).sqrt()
-
-    d, _ = d.min(axis=-1)
-    d[
-        torch.isnan(d)
-    ] = 1  # replace nan with 0 (this happens when the determinant is near 0)
-
-    # zero out all local tensors
-    del Z_followers
-    del Z_leaders
-    del Z_error
-    del P
-    del S
-    torch.cuda.empty_cache()
-
-    d = d.detach().cpu().numpy()
-    gc.collect()
-
-    return df.with_columns(
-        [
-            pl.Series(d).alias("association_distance"),
-        ]
-    )
-
-
-def mahalanobis_distance(
-    df: pl.DataFrame,
-    cutoff: float = None,
-    gpu: bool = True,
-    pos_override=None,
-    return_maha: bool = False,
-) -> pl.DataFrame:
-    device = torch.device("cuda" if gpu else "cpu")
-
-    H = build_h_matrix().to(device)
-
-    R = build_r_matrix().to(device)
-
-    P_follower = torch.from_numpy(
-        df["P"]
-        .to_numpy()
-        .copy()
-        .reshape(-1, 6, 6)
-        .astype(
-            dtype=np.float32,
-        )
-    ).to(device)
-
-    P_leader = torch.from_numpy(
-        df["P_leader"]
-        .to_numpy()
-        .copy()
-        .reshape(-1, 6, 6)
-        .astype(
-            dtype=np.float32,
-        )
-    ).to(device)
-
-    S_leader = H @ P_leader @ H.T + R
-    S_follower = H @ P_follower @ H.T + R
-
-    S = S_leader + S_follower
-
-    Z_followers = []
-    Z_leaders = []
-
-    create_z_matrices(df, Z_followers, Z_leaders, pos_override=pos_override)
-
-    Z_followers = torch.stack(Z_followers, dim=1).to(device)
-    Z_leaders = torch.stack(Z_leaders, dim=1).to(device)
-    Z_error = Z_followers - Z_leaders
-
-    # calculate the mahalanobis distance
-    m_sq = (
-        Z_error.transpose(-1, -2)
-        @ torch.linalg.pinv(
-            S,
-        )[..., None, :, :]
-        @ Z_error
-    ).squeeze()
-
-    if return_maha:
-        return df.with_columns(
-            [
-                pl.Series(m_sq.detach().cpu().numpy()).alias("m_sq"),
-            ]
-        )
-
-    assert cutoff is not None, "Must provide a cutoff"
-
-    # find which is inside the gate
-    inside_gate_1 = m_sq < cutoff
-
-    inside_gate = (inside_gate_1).any(-1)
-
-    return df.with_columns(
-        [
-            pl.Series(inside_gate.detach().cpu().numpy()).alias("inside_gate"),
-        ]
-    )
 
 
 class IMF:
@@ -346,12 +39,17 @@ class IMF:
         X[t_index, v_index, z_index] = torch.from_numpy(
             df[
                 [
-                    s_col,
+                    # "s",
+                    # "front_s",
+                    # "back_s",
+                    "s",
                     "s_velocity",
                     "s_accel",
                     "d",
                     "d_velocity",
                     "d_accel",
+                    # "distanceToFront_s",
+                    # "distanceToBack_s",
                 ]
             ]
             .cast(pl.Float32)
@@ -403,11 +101,6 @@ class IMF:
                 shape=(self.v_dim, self.z_dim, self.x_dim, self.x_dim),
             ).to(self.device)
 
-            Q = CALCFilter.Q_static(
-                dt_vect=self.Dt[t],
-                shape=(self.v_dim, self.z_dim, self.x_dim, self.x_dim),
-            ).to(self.device)
-
             x_hat_t_t1 = (F[..., 0, :, :] @ self.X_hat[t - 1,].unsqueeze(-1)).squeeze()
 
             p_hat_t_t1 = (
@@ -417,7 +110,7 @@ class IMF:
 
             # predict the individual measurements
             x_t_t1 = (F @ self.X[t - 1].unsqueeze(-1)).squeeze()
-            p_t_t1 = F @ self.P[t - 1] @ F.transpose(-1, -2) #+ Q
+            p_t_t1 = F @ self.P[t - 1] @ F.transpose(-1, -2)  # + Q
 
             # precompute the inverse
             p_hat_t_t1_i = torch.linalg.pinv(p_hat_t_t1, hermitian=True)
@@ -507,13 +200,6 @@ class CI(IMF):
         super().__init__(df, *args, **kwargs)
 
     def apply_filter(self) -> None:
-        # CALKFilter.w_d = 1
-        # CALKFilter.w_s = 2
-        # CALKFilter.w_s = 0.1
-
-        R = build_r_matrix().to(self.device)
-        H = build_h_matrix().to(self.device)
-
         for t in tqdm(range(1, self.t_dim)):
             x_t = self.X[t]
             p_t = self.P[
@@ -531,7 +217,7 @@ class CI(IMF):
             ).to(self.device)
 
             self.X_hat[t] = (F @ self.X_hat[t - 1,].unsqueeze(-1)).squeeze()
-            self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2) #+ Q
+            self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2) + Q
             # do the recursive update
             # for z in range(self.z_dim, ):
             # update in reverse order
@@ -540,36 +226,20 @@ class CI(IMF):
 
                 mask = x_t[:, z].abs().sum(axis=-1) > 0.1
 
-                # if z > 0:
-                #     # only gate measurements that are > index 0
-                #     S = H @ self.P_hat[t, mask] @ H.T + R
-                #     z_error = ((x_t[mask, z, :] - self.X_hat[t, mask]) @ H.T).unsqueeze(
-                #         -1
-                #     )
-                #     # calculate the maha distance and gate it
-                #     m_sq = (
-                #         z_error.transpose(-1, -2) @ torch.pinverse(S) @ z_error
-                #     ).squeeze()
-
-                #     # IDK if more expensive to clone the mask
-                #     # or to do the indexing. Going with Clone cause lazy
-                #     mask[mask.clone()] &= m_sq < chi2.ppf(0.99, 4)
-
-                omega = trace(p_t[mask, z]) / (
-                    trace(self.P_hat[t, mask]) + trace(p_t[mask, z])
+                omega = determinant(p_t[mask, z]) / (
+                    determinant(self.P_hat[t, mask]) + determinant(p_t[mask, z])
                 )
-                # clip omega to (0, 1)
-
-                # a1 = torch.linalg.lstsq()
 
                 a1 = omega[..., None, None] * torch.linalg.pinv(
-                    self.P_hat[t, mask], hermitian=True
+                    self.P_hat[t, mask],
                 )
                 a2 = (1 - omega[..., None, None]) * torch.linalg.pinv(
-                    p_t[mask, z], hermitian=True
+                    p_t[mask, z],
                 )
 
-                self.P_hat[t, mask] = torch.linalg.pinv(a1 + a2, hermitian=True)
+                self.P_hat[t, mask] = torch.linalg.pinv(
+                    a1 + a2,
+                )
                 self.X_hat[t, mask] = (
                     self.P_hat[t, mask]
                     @ (
@@ -583,56 +253,57 @@ class ImprovedFastCI(IMF):
     #  from https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=1591849
 
     def apply_filter(self) -> None:
-        CALCFilter.w_s = 2
-        CALCFilter.w_d = 1
+        R = build_r_matrix(
+            pos_error=np.sqrt(0.5),
+            pos_velo_error=np.sqrt(0.8112),
+            d_pos_error=np.sqrt(0.1),
+            d_velo_error=np.sqrt(0.1),
+            dims=4,
+        ).to(self.device)
+        H = build_h_matrix(dims=4).to(self.device)
 
-        # R = build_r_matrix(pos_error=0.5, d_pos_error=0.5).to(self.device)
-        # H = build_h_matrix().to(self.device)
+        P_mod = (
+            H.T @ R @ H
+        )  # / 10 #+ CALCFilter.P_mod * torch.eye(self.x_dim).to(self.device)
+        self.P += P_mod
+        self.P_hat += P_mod
 
-        # # # scale R to a x,dim x dim matrix
-        # P_mod = (
-        #     H.T @ R @ H
-        # )  # / 10 #+ CALCFilter.P_mod * torch.eye(self.x_dim).to(self.device)
-
-        # self.P[:, ...]  = P_mod.clone() #+ CALCFilter.P_mod * torch.eye(self.x_dim).to(self.device)
-        # self.P_hat[0, ...] = P_mod
-        # # self.P = torch.clamp(self.P, min=0, max=15)
-        # self.P_hat = torch.clamp(self.P_hat, min=0, max=1)
         for t in tqdm(range(1, self.t_dim)):
             x_t = self.X[t]
-            # clamp the P matrix to be positive definite
-            self.P[t, ...] = torch.clamp(self.P[t, ...], min=1e-9, )
-            p_t = self.P[t]  # + P_mod
+            p_t = self.P[t]
 
             F = CALCFilter.F_static(
                 dt_vect=self.Dt[t, :, 0],
                 shape=(self.v_dim, self.x_dim, self.x_dim),
+                # duplicate_pos_count=3,
             ).to(self.device)
 
+            Q = CALCFilter.Q_static(
+                dt_vect=self.Dt[t, :, 0],
+                shape=(self.v_dim, self.x_dim, self.x_dim),
+                # duplicate_pos_count=3
+            ).to(self.device)
             self.X_hat[t] = (F @ self.X_hat[t - 1,].unsqueeze(-1)).squeeze()
-            self.P_hat[t] = (
-                    F @ self.P_hat[t - 1,] @ F.transpose(
-                    -1, -2
-                ) 
-                # + CALCFilter.Q_static(
-                #     dt_vect=self.Dt[t, :, 0],
-                #     shape=(self.v_dim, self.x_dim, self.x_dim),
-                #     speed_info=x_t[:, 0, 1],
-                # ).to(self.device)
-            )
+            self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2) + Q
 
             for z in range(self.z_dim):
                 mask = x_t[:, z].abs().sum(axis=-1) > 0.1
 
-                I_i = torch.linalg.pinv(p_t[mask, z], )
-                I_hat = torch.linalg.pinv(self.P_hat[t, mask], )
+                I_i = torch.linalg.pinv(
+                    p_t[mask, z],
+                )
+                I_hat = torch.linalg.pinv(
+                    self.P_hat[t, mask],
+                )
                 d_i = determinant(I_hat + I_i)
                 omega = (d_i - determinant(I_i) + determinant(I_hat)) / (2 * d_i)
 
                 a1 = omega[..., None, None] * I_hat
                 a2 = (1 - omega[..., None, None]) * I_i
 
-                self.P_hat[t, mask] = torch.linalg.pinv(a1 + a2,)
+                self.P_hat[t, mask] = torch.linalg.pinv(
+                    a1 + a2,
+                )
                 self.X_hat[t, mask] = (
                     self.P_hat[t, mask]
                     @ (
@@ -640,122 +311,6 @@ class ImprovedFastCI(IMF):
                         + a2 @ x_t[mask, z].unsqueeze(-1)
                     )
                 ).squeeze()
-
-
-class MeasurementCI(IMF):
-    def apply_filter(self) -> None:
-        H = build_h_matrix().to(self.device)
-        R = build_r_matrix(pos_error=2.5, d_pos_error=1.5).to(self.device)
-        eye = torch.eye(self.x_dim).to(self.device)
-        # diag_mask = torch.eye(self.x_dim).byte()
-        # other_mask = ~diag_mask
-
-        for t in tqdm(range(1, self.t_dim)):
-            x_t = self.X[t]
-            # p_t = self.P[t]
-            z_t = x_t @ H.T
-
-            F = CALCFilter.F_static(
-                dt_vect=self.Dt[t, :, 0],
-                shape=(self.v_dim, self.x_dim, self.x_dim),
-            ).to(self.device)
-
-            Q = CALCFilter.Q_static(
-                dt_vect=self.Dt[t, :, 0],
-                shape=(self.v_dim, self.x_dim, self.x_dim),
-            ).to(self.device)
-
-            self.X_hat[t] = (F @ self.X_hat[t - 1,].unsqueeze(-1)).squeeze()
-            self.P_hat[t] = F @ self.P_hat[t - 1,] @ F.transpose(-1, -2) + Q
-
-            omega = torch.tensor(0.5).to(self.device)
-
-            z_hat_t = self.X_hat[t] @ H.T
-
-            for z in range(self.z_dim):
-                mask = x_t[:, z].abs().sum(axis=-1) > 0.1
-
-                y = z_t[mask, z] - z_hat_t[mask]
-
-                sigma_y = H @ ((1 / omega) * self.P_hat[t, mask]) @ H.T + (
-                    R / (1 - omega)
-                )
-                K = (1 / omega) * self.P_hat[t, mask] @ H.T @ torch.linalg.pinv(sigma_y)
-
-                self.P_hat[t, mask] = (eye - K @ H) @ (
-                    (1 / omega) * self.P_hat[t, mask]
-                ) @ (eye - K @ H).mT + K @ (1 / (1 - omega) * R) @ K.mT
-
-                self.X_hat[t, mask] = (
-                    self.X_hat[t, mask] + (K @ y.unsqueeze(-1)).squeeze()
-                ).squeeze()
-
-
-# class SplitMeasurementCI(IMF):
-
-#     def __init__(self, df: pl.DataFrame, gpu: bool = True, s_col: str = "s") -> None:
-#         super().__init__(df, gpu, s_col)
-
-
-#     def apply_filter(self) -> None:
-#         H = build_h_matrix().to(self.device)
-#         R = build_r_matrix(pos_error=3, d_pos_error=1).to(self.device)
-#         R_d =
-
-#         for t in tqdm(range(1, self.t_dim)):
-#             x_t = self.X[t]
-#             p_t = self.P[t]
-#             z_t = x_t @ H.T
-
-#             F = CALCFilter.F_static(
-#                 dt_vect=self.Dt[t, :, 0],
-#                 shape=(self.v_dim, self.x_dim, self.x_dim),
-#             ).to(self.device)
-
-#             Q = CALCFilter.Q_static(
-#                 dt_vect=self.Dt[t, :, 0],
-#                 shape=(self.v_dim, self.x_dim, self.x_dim),
-#             ).to(self.device)
-
-#             # split the Q matrix
-#             Q_d = Q.clone()
-#             Q_d.masked_fill(diag_mask, 0)
-#             Q_i = Q.clone()
-#             Q_i.masked_fill(other_mask, 0)
-
-#             self.X_hat[t] = (F @ self.X_hat[t - 1,].unsqueeze(-1)).squeeze()
-
-#             # split the P matrix
-#             P_d = self.P_hat[t, :, ].clone()
-#             P_d.masked_fill(diag_mask, 0)
-#             P_i = self.P_hat[t, :, ].clone()
-#             P_i.masked_fill(other_mask, 0)
-
-#             omega = torch.tensor(0.5).to(self.device)
-
-#             for z in range(self.z_dim):
-#                 mask = x_t[:, z].abs().sum(axis=-1) > 0.1
-
-#                 z_hat_t = self.X_hat[t] @ H.T
-#                 y = z_t[mask, z] - z_hat_t[mask]
-
-#                 sigma_y = H @ (
-#                     (1 / omega) * self.P_hat[t, mask]
-#                 ) @ H.T + (R / (1 - omega))
-#                 K = (
-#                     (1 / omega)
-#                     * self.P_hat[t, mask]
-#                     @ H.T
-#                     @ torch.linalg.pinv(sigma_y)
-#                 )
-
-#                 self.P_hat[t, mask] = (eye - K @ H) @ (
-#                     (1 / omega) * self.P_hat[t, mask]
-#                 ) @ (eye - K @ H).mT + K @ (1 / (1 - omega) * R) @ K.mT
-
-#                 self.X_hat[t, mask] = (
-#                     self.X_hat[t, mask] + (K @ y.unsqueeze(-1)).squeeze()
-#                 ).squeeze()
 
 
 def batch_join(
@@ -786,23 +341,9 @@ def batch_join(
         dfs = []
 
         # create a list of the chunks
-        for chunk_df in (
-            filter_df
-            # # .filter(pl.col("filter"))
-            .with_columns(
-                (pl.col("vehicle_id_int") // batch_size).alias("chunk")
-            ).partition_by("chunk")
-            # tqdm(
-            #     # list(
-            #     gen_chunks(
-            #         filter_df,
-            #         chunk_size=batch_size,
-            #         vehicle_index="vehicle_id_int",
-            #         time_index="time_index",
-            #     )
-            #     # )
-            # )
-        ):
+        for chunk_df in filter_df.with_columns(
+            (pl.col("vehicle_id_int") // batch_size).alias("chunk")
+        ).partition_by("chunk"):
             offset = chunk_df["vehicle_id_int"].min()
 
             # create a new vehicle id
@@ -837,12 +378,10 @@ def batch_join(
                     ],
                     how="inner",
                 )
-                # .with_columns(
-                #     (pl.col("vehicle_id_int") + offset).alias("vehicle_id_int")
-                # )
                 .drop("vehicle_id_int")
             )
 
+            # try to free GPU memory
             imf.cleanup()
             del imf
             torch.cuda.empty_cache()
@@ -878,7 +417,7 @@ def batch_join(
     except Exception as e:
         if "imf" in locals():
             imf.cleanup()  # noqa: F821
-        del imf
+        del imf  # noqa: F821
         torch.cuda.empty_cache()
         gc.collect()
 
@@ -913,24 +452,6 @@ def rts_smooth(
     for chunk_df in df.with_columns(
         (pl.col("vehicle_id_int") // batch_size).alias("chunk")
     ).partition_by("chunk"):
-        # create a list of the chunks
-        # for chunk_df in (
-        #         df
-        #         # .filter(pl.col("filter"))
-        #         .with_columns(
-        #             (pl.col("vehicle_id_int") // batch_size).alias("chunk")
-        #         ).partition_by("chunk")
-        #         # tqdm(
-        #         #     list(
-        #         #         gen_chunks(
-        #         #             df,
-        #         #             chunk_size=batch_size,
-        #         #             vehicle_index="vehicle_id_int",
-        #         #             time_index="time_index",
-        #         #         )
-        #         #     )
-        #         # )
-        #     ):
         _inner_rts(dfs, chunk_df, device, s_col)
 
         torch.cuda.empty_cache()
@@ -946,9 +467,6 @@ def _inner_rts(
             "vehicle_id_int"
         )
     )
-
-    # CALCFilter.w_s = 4
-    # CALCFilter.w_d = 2
 
     t_dim = chunk_df["time_index"].max() + 1
     v_dim = chunk_df["vehicle_id_int"].max() + 1

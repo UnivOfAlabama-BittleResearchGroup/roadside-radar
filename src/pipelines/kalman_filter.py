@@ -5,7 +5,7 @@ from typing import Tuple
 
 
 @lazify
-@timeit
+# @timeit
 def prepare_frenet_measurement(
     df: pl.DataFrame,
 ) -> pl.DataFrame:
@@ -68,9 +68,15 @@ def prepare_frenet_measurement(
             (pl.col("f32_velocityInDir_mps") * pl.col("angle_diff").cos()).alias(
                 "s_velocity"
             ),
+            # (pl.col("f32_velocityInDir_mps")).alias(
+            #     "s_velocity"
+            # ),
             (pl.col("f32_velocityInDir_mps") * pl.col("angle_diff").sin()).alias(
                 "d_velocity"
             ),
+            # pl.lit(0).cast(pl.Float32).alias(
+            #     "d_velocity"
+            # ),
             (pl.col("f32_distanceToFront_m") * pl.col("angle_diff").cos()).alias(
                 "distanceToFront_s"
             ),
@@ -84,7 +90,7 @@ def prepare_frenet_measurement(
 
 
 @lazify
-@timeit
+# @timeit
 def filter_short_trajectories(
     df: pl.DataFrame,
     minimum_distance_m: float = 10,
@@ -114,7 +120,7 @@ def filter_short_trajectories(
 
 
 @lazify
-@timeit
+# @timeit
 def build_extension(
     df: pl.DataFrame,
     seconds: float = 4,
@@ -122,10 +128,11 @@ def build_extension(
     id_cols: Tuple[str] = ("kalman_id",),
 ) -> pl.DataFrame:
     # take the last data point from the radar, and then extend it
-    df = df.lazy()
-
+    # df = df.lazy()
+    dt = dt * 1000
     return (
-        df.lazy()
+        df
+        .lazy()
         .group_by(id_cols)
         .agg(
             pl.col("epoch_time").min(),
@@ -138,23 +145,24 @@ def build_extension(
             ).alias("total_duration_s"),
         )
         .with_columns(
-            ((pl.col("total_duration_s") + seconds) / dt).cast(int).alias("n_steps"),
-            pl.lit(dt).alias("dt"),
+            ((pl.col("total_duration_s") + seconds) / (dt / 1000)).cast(int).alias("n_steps"),
+            # pl.lit(dt * 1000).cast(int).alias("dt"),
+            pl.lit(dt).cast(int).alias("dt"),
         )
         .with_columns(
             pl.col("dt").repeat_by(pl.col("n_steps")).alias("dt"),
         )
         .explode("dt")
-        .with_columns((pl.col("dt").cumsum() * 1000).cast(int).over(id_cols))
+        .with_columns((pl.col("dt").cumsum()).cast(int).over(id_cols))
         .with_columns(
             (pl.duration(milliseconds="dt") + pl.col("epoch_time"))
             .dt.round(every="100ms")
             .alias("epoch_time")
         )
         .with_columns((pl.col("epoch_time") > pl.col("max_time")).alias("prediction"))
-        .drop(["dt", "n_steps", "total_duration_s", "max_time"])
+        .drop(["dt", "n_steps", "total_duration_s", ])
         .join(
-            df.with_columns(
+            df.lazy().with_columns(
                 pl.lit(False).alias("missing_data"),
                 pl.col("epoch_time").dt.round(every="100ms"),
             ),
@@ -162,7 +170,9 @@ def build_extension(
             how="left",
         )
         .filter(
-            ~((pl.col('object_id').cum_count() == 0) & (pl.col('object_id').is_null())).over(id_cols)
+            ~(
+                (pl.col("object_id").cum_count() == 0) & (pl.col("object_id").is_null())
+            ).over(id_cols)
         )
         .sort(by=[*id_cols, "epoch_time"])
         .with_columns(
@@ -170,81 +180,19 @@ def build_extension(
             pl.col("prediction").fill_null(False),
         )
         .with_columns(
-            pl.col(set(df.columns) - {"prediction", "missing_data"}).forward_fill()
+            pl.col(
+                set(df.columns) - {"prediction", "missing_data"}
+            ).forward_fill()
         )
-        .collect()
+        .collect(streaming=True)
         .rechunk()
         .set_sorted(["object_id", "lane", "epoch_time"])
         .lazy()
     )
 
-#     return test
-# @lazify
-# @timeit
-# def build_extension(
-#     df: pl.DataFrame, seconds: float = 4, dt: float = 0.1
-# ) -> pl.DataFrame:
-#     # take the last data point from the radar, and then extend it
-#     df = df.lazy()
-
-#     # get the datatype of the epoch_time column
-#     time_dt = df.dtypes[df.columns.index("epoch_time")]
-
-#     test = (
-#         df.lazy()
-#         .group_by(["object_id", "lane"])
-#         .agg(
-#             pl.col("epoch_time").min(),
-#             pl.col("epoch_time").max().alias("max_time"),
-#             (
-#                 (
-#                     pl.col("epoch_time").max() - pl.col("epoch_time").min()
-#                 ).dt.milliseconds()
-#                 / 1e3
-#             ).alias("total_duration_ms"),
-#         )
-#         .with_columns(
-#             ((pl.col("total_duration_ms") + seconds) / dt).cast(int).alias("n_steps"),
-#             pl.lit(dt).alias("dt"),
-#         )
-#         .with_columns(
-#             pl.col("dt").repeat_by(pl.col("n_steps")).alias("dt"),
-#         )
-#         .explode("dt")
-#         .with_columns(
-#             (
-#                 pl.col("dt").cumsum().over(["object_id", "lane"]) * 1e3
-#                 + pl.col("epoch_time").cast(float)
-#             )
-#             .cast(time_dt)
-#             .alias("epoch_time")
-#         )
-#         .with_columns((pl.col("epoch_time") > pl.col("max_time")).alias("prediction"))
-#         .drop(["dt", "n_steps", "total_duration_ms", "max_time"])
-#         .join(
-#             df.with_columns(pl.lit(False).alias("missing_data")),
-#             on=["object_id", "epoch_time", "lane"],
-#             how="left",
-#         )
-#         .sort(by=["object_id", "lane", "epoch_time"])
-#         .with_columns(
-#             pl.col("missing_data").fill_null(True),
-#             pl.col("prediction").fill_null(False),
-#         )
-#         .with_columns(
-#             pl.col(set(df.columns) - {"prediction", "missing_data"}).forward_fill()
-#         )
-#         .collect()
-#         .rechunk()
-#         .set_sorted(["object_id", "lane", "epoch_time"])
-#         .lazy()
-#     )
-
-#     return test
-
 
 @lazify
-@timeit
+# @timeit
 def add_timedelta(df: pl.DataFrame, vehicle_id_col: str = "kalman_id") -> pl.DataFrame:
     return (
         df.lazy()
@@ -259,7 +207,7 @@ def add_timedelta(df: pl.DataFrame, vehicle_id_col: str = "kalman_id") -> pl.Dat
 
 
 @lazify
-@timeit
+# @timeit
 def build_kalman_id(
     df: pl.DataFrame,
     split_time_delta: float = 4,
@@ -295,11 +243,12 @@ def build_kalman_id(
 
 
 @lazify
-@timeit
+# @timeit
 def build_kalman_df(
     df: pl.DataFrame,
     minimum_data_points: int = 10,
     s_col: str = "s",
+    derive_s_vel: bool = False,
 ) -> pl.DataFrame:
     kalman_df = (
         df.lazy()
@@ -321,6 +270,7 @@ def build_kalman_df(
                 pl.col("prediction"),
                 pl.col("missing_data"),
                 pl.col("epoch_time").cum_count().over("kalman_id").alias("time_ind"),
+                pl.col("s_velocity"),
             ]
         )
         .with_columns(
@@ -328,6 +278,13 @@ def build_kalman_df(
         )
         .filter(pl.col("max_time") > minimum_data_points)
     )
+
+    if derive_s_vel:
+        if s_col != 's':
+            print(f'Warning: s_dot might be noisy using {s_col}')
+        df = df.with_columns(
+            (pl.col(s_col).diff() / pl.col('time_diff')).reverse().rolling_mean(window_size=20).reverse().over('kalman_id').alias('s_velocity')
+        )
 
     vehicle_inds = (
         kalman_df.group_by("kalman_id")

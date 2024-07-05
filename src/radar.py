@@ -1,13 +1,10 @@
 import os
-from typing import Dict, List, Set, Tuple, TYPE_CHECKING
+from typing import Dict, Tuple, TYPE_CHECKING
 import numpy as np
 import polars as pl
 import yaml
 import utm
-from shapely.geometry import Polygon
 import math
-
-from src.frenet import SplineLane
 
 
 if TYPE_CHECKING:
@@ -70,8 +67,7 @@ class BasicRadar:
     @classmethod
     @timeit
     def create_object_id(cls, df: pl.DataFrame) -> pl.DataFrame:
-        # make the object id the ui32_objectId + the ip + the date
-        return df.with_columns(
+        df = df.with_columns(
             [
                 pl.struct(
                     [
@@ -84,6 +80,8 @@ class BasicRadar:
                 .alias("object_id"),
             ]
         )
+
+        return df
 
     @classmethod
     @timeit
@@ -319,28 +317,6 @@ class BasicRadar:
 
     @classmethod
     @timeit
-    def new_object_id(
-        cls,
-        df: pl.DataFrame,
-        object_id_cols: Tuple[str] = ("object_id", "lane_group"),
-    ) -> pl.DataFrame:
-        assert all(c in df.columns for c in object_id_cols), (
-            "object_id_cols must be in the dataframe",
-        )
-
-        return df.with_columns(
-            [
-                pl.concat_str(
-                    [pl.col(c).cast(pl.Utf8) for c in object_id_cols], separator="~"
-                )
-                .cast(pl.Categorical)
-                .cast(pl.Int64)
-                .alias("object_id"),
-            ]
-        )
-
-    @classmethod
-    @timeit
     def rotate_radars(
         cls, df: pl.DataFrame, angle_mapping: Dict[str, float] = None
     ) -> pl.DataFrame:
@@ -391,315 +367,6 @@ class BasicRadar:
             .drop(["x_origin", "y_origin"])
         )
 
-    @classmethod
-    @timeit
-    def _get_directed_d(
-        cls,
-        df: pl.DataFrame,
-        x1_col: str = "utm_x",
-        y1_col: str = "utm_y",
-        x2_col: str = "x",
-        y2_col: str = "y",
-        d_col: str = "min_d",
-        ds_du_x_col: str = "ds_du_x",
-        ds_du_y_col: str = "ds_du_y",
-    ) -> pl.DataFrame:
-        # calculate the directives
-        # https://stackoverflow.com/a/16544330
-        # dot = x1*x2 + y1*y2      # Dot product between [x1, y1] and [x2, y2]
-        # det = x1*y2 - y1*x2      # Determinant
-        return (
-            df.with_columns(
-                [
-                    (pl.col(x2_col) - pl.col(x1_col)).alias("dx"),
-                    (pl.col(y2_col) - pl.col(y1_col)).alias("dy"),
-                ]
-            )
-            .with_columns(
-                [
-                    # calculate the angle between the lane and the car
-                    (
-                        # calculate the dot product
-                        pl.col("dx") * pl.col(ds_du_x_col)
-                        + pl.col("dy") * pl.col(ds_du_y_col)
-                    ).alias("dot"),
-                    # calculate the cross product
-                    (
-                        pl.col("dx") * pl.col(ds_du_y_col)
-                        - pl.col("dy") * pl.col(ds_du_x_col)
-                    ).alias("cross"),
-                ]
-            )
-            .with_columns(pl.atan2(pl.col("cross"), pl.col("dot")).alias("angle_d"))
-            .with_columns(
-                [
-                    pl.when(pl.col("angle_d") > np.pi)
-                    .then(pl.col(d_col) * -1)
-                    .otherwise(pl.col(d_col))
-                    .alias(d_col),
-                ]
-            )
-            .drop(
-                [
-                    "dot",
-                    "cross",
-                    "angle_d",
-                    "dx",
-                    "dy",
-                ]
-            )
-        )
-
-    @classmethod
-    @timeit
-    def map_frenet_lanes(
-        cls,
-        df: pl.DataFrame,
-        lanes: List[SplineLane],
-        distance_threshold: float = 3,
-        drop_outside: bool = True,
-        directed: bool = True,
-    ) -> pl.DataFrame:
-        """
-        *This will drop any data that is greater than distance_threshold from a lane*
-
-        Args:
-            df (pl.DataFrame): _description_
-            lanes (List[SplineLane]): _description_
-            distance_threshold (float, optional): _description_. Defaults to 6.
-
-        Returns:
-            pl.DataFrame: _description_
-        """
-
-        from scipy.spatial import KDTree
-
-        # create a dataframe of all the lanes
-        kdtree_df = pl.concat(
-            [
-                lane.fitted_pl_df.with_columns(
-                    [
-                        pl.lit(lane.name).alias("lane"),
-                    ]
-                )
-                for lane in lanes
-            ]
-        ).with_row_count()
-
-        # create a kdtree
-        kdtree = KDTree(kdtree_df[["x", "y"]].to_numpy())
-
-        # get the nearest lane
-        d, nearest_lane_index = kdtree.query(
-            df[["utm_x", "utm_y"]].to_numpy(),
-            k=1,
-            distance_upper_bound=distance_threshold,
-            p=2,
-            workers=-1,
-            eps=1e-9,
-        )
-
-        # replace the inf values with nan
-        df = (
-            df.with_columns(
-                [
-                    pl.Series(
-                        "lane_ind",
-                        nearest_lane_index,
-                        dtype=pl.UInt32,
-                    ),
-                    pl.Series(
-                        "min_d",
-                        d,
-                        dtype=pl.Float32,
-                    ),
-                ]
-            )
-            # get the nearest lane
-            .join(
-                kdtree_df,
-                how="inner" if drop_outside else "left",
-                left_on="lane_ind",
-                right_on="row_nr",
-            )
-        )
-        return (
-            df.pipe(
-                cls._get_directed_d,
-            )
-            if directed
-            else df
-        )
-
-    @classmethod
-    @timeit
-    def map_frenet_lane_constrained(
-        cls,
-        df: pl.DataFrame,
-        lanes: List[SplineLane],
-        filter_expr: pl.Expr,
-        distance_threshold: float = 6,
-        lane_col: str = "lane",
-    ) -> pl.DataFrame:
-        if "row_nr" not in df.columns:
-            df = df.with_row_count()
-
-        snap_df = df.filter(filter_expr)
-
-        new_dfs = []
-        for l in lanes:
-            l_df = snap_df.filter((pl.col(lane_col) == l.name))
-            # create a dataframe of all the lanes
-            d, ind = l.kdtree.query(
-                l_df[["utm_x", "utm_y"]].to_numpy(),
-                p=2,
-                workers=-1,
-                distance_upper_bound=distance_threshold,
-            )
-            ltree_df = l.fitted_pl_df
-            l_df = (
-                l_df.with_columns(
-                    [
-                        pl.Series(
-                            "lane_ind",
-                            ind,
-                            dtype=pl.UInt32,
-                        ),
-                        pl.Series(
-                            "min_d",
-                            d,
-                            dtype=pl.Float64,
-                        ),
-                    ]
-                )
-                .drop(ltree_df.columns)
-                .join(
-                    ltree_df.with_row_count(),
-                    how="inner",
-                    left_on="lane_ind",
-                    right_on="row_nr",
-                )
-                .pipe(
-                    cls._get_directed_d,
-                )
-            )
-
-            new_dfs.append(l_df)
-
-        if not new_dfs:
-            return df
-
-        new_df = pl.concat(new_dfs)
-
-        return df.update(
-            new_df,
-            how="left",
-            on=["row_nr"],
-        )
-
-    @classmethod
-    @timeit
-    def get_s_frame_lateral_error_df(
-        cls, df: pl.DataFrame, agg_interval: int = 1, normalize: bool = True
-    ) -> pl.DataFrame:
-        assert (
-            "s" in df.columns
-        ), "s must be in the dataframe. Call map_frenet_lanes first"
-        assert (
-            "min_d" in df.columns
-        ), "min_d must be in the dataframe. Call map_frenet_lanes first"
-
-        if agg_interval > 1:
-            raise NotImplementedError("agg_interval > 1 not implemented yet")
-
-        return (
-            df.lazy()
-            .with_columns(
-                [
-                    # cast s to int
-                    pl.col("s").round().cast(pl.Int32).alias("s_int"),
-                ]
-            )
-            .groupby(["ip", "lane", "s_int"])
-            .agg(
-                [
-                    pl.col("min_d").mean().alias("min_d"),
-                    pl.col("min_d").quantile(0.25).alias("min_d_25"),
-                    pl.col("min_d").quantile(0.75).alias("min_d_75"),
-                ]
-            )
-            .sort(by=["ip", "s_int"])
-            .collect()
-        )
-
-    @classmethod
-    @timeit
-    def norm_s_to_stopbar(
-        cls, df: pl.DataFrame, lanes: List[SplineLane]
-    ) -> pl.DataFrame:
-        assert (
-            "tl" in df.columns
-        ), "tl must be in the dataframe. This should map a radar to the traffic signal"
-        assert (
-            "s_int" in df.columns
-        ), "s_int must be in the dataframe. Call get_s_frame_lateral_error_df first"
-
-        local_df = df.lazy().with_columns([pl.lit(0).alias("s_int_norm")])
-
-        for l in lanes:
-            for detector in l.detectors:
-                local_df = local_df.with_columns(
-                    pl.when(
-                        (pl.col("lane") == l.name)
-                        & (pl.col("tl") == detector.attrs["tl"])
-                    )
-                    .then((pl.col("s_int") - detector.s))
-                    .otherwise(pl.col("s_int_norm"))
-                    .alias("s_int_norm")
-                )
-
-        local_df = local_df.collect()
-
-        # reverse the sign of subtraction for radars that point in the opposite direction
-        reverse = (
-            local_df.groupby(["ip", "lane"])
-            .agg([pl.col("s_int_norm").mean().alias("s_int_norm")])
-            .filter(pl.col("s_int_norm") < 0)
-            .select(["ip", "lane"])
-        )
-
-        return local_df.with_columns(
-            [
-                pl.when(
-                    pl.col("ip").is_in(reverse["ip"])
-                    & pl.col("lane").is_in(reverse["lane"])
-                )
-                .then(pl.col("s_int_norm") * -1)
-                .otherwise(pl.col("s_int_norm"))
-                .alias("s_int_norm")
-            ]
-        )
-
-    @timeit
-    def correct_center(
-        cls,
-        df: pl.DataFrame,
-        x_col: str = "f32_positionX_m",
-        y_col: str = "f32_positionY_m",
-    ) -> pl.DataFrame:
-        return df.with_columns(
-            [
-                # precompute the angle sin and cos
-                (
-                    pl.col(x_col)
-                    - (pl.col("f32_directionX") * pl.col("f32_distanceToBack_m"))
-                ).alias(x_col),
-                (
-                    pl.col(y_col)
-                    - (pl.col("f32_directionY") * pl.col("f32_distanceToBack_m"))
-                ).alias(y_col),
-            ]
-        )
 
     @classmethod
     @timeit
@@ -879,33 +546,6 @@ class CalibratedRadar(BasicRadar):
                 on="latlon_index",
                 how="left",
             ).drop(["latlon_index"])
-
-    @timeit
-    def radar_to_h3(
-        self, df: pl.DataFrame, col_name: str = "h3", resolution: int = None
-    ) -> pl.DataFrame:
-        import h3.api.numpy_int as h3
-        return df.with_column(
-            pl.struct(["lat", "lon"])
-            .apply(
-                lambda x: h3.geo_to_h3(x["lat"], x["lon"], resolution),
-                return_dtype=pl.Utf8,
-            )
-            .alias(col_name)
-        )
-
-    @timeit
-    def int_h3_2_str(self, df: pl.DataFrame) -> pl.DataFrame:
-        if df["h3"].dtype == pl.Utf8:
-            return df
-
-        import h3.api.basic_int as h3_int
-
-        return df.with_columns([pl.col("h3").apply(h3_int.h3_to_string).alias("h3")])
-
-    @timeit
-    def filter_network_boundaries(self, df: pl.DataFrame) -> pl.DataFrame:
-        return df.filter(pl.col("h3").is_in(list(self.network_boundary)))
 
 
 def plot_lateral_error(

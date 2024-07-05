@@ -34,7 +34,7 @@ def build_h_matrix() -> FloatTensor:
     )
 
 
-def build_r_matrix(pos_error: float = 0.5, d_pos_error: float = 0.5) -> FloatTensor:
+def build_r_matrix(pos_error: float = None, d_pos_error: float = None) -> FloatTensor:
     """
     Build the R matrix for the Kalman filter
 
@@ -45,13 +45,18 @@ def build_r_matrix(pos_error: float = 0.5, d_pos_error: float = 0.5) -> FloatTen
         0.1  # constant uncertainty based on the discretization of the frenet frame
     )
 
+    # pos_error = pos_error or np.sqrt(1.88)
+    pos_error = 0.5
+    # d_pos_error = d_pos_error or np.sqrt(0.7)
+    d_pos_error = 0.5
+
     return torch.Tensor(
-        np.array(
+        np.diag(
             [
-                [pos_error + discretization_error, 0, 0, 0],
-                [0, 0.5 + discretization_error, 0, 0],
-                [0, 0, d_pos_error + discretization_error, 0],
-                [0, 0, 0, 0.5 + discretization_error],
+                pos_error + discretization_error,
+                1.013779,
+                d_pos_error + discretization_error,
+                0.5
             ]
         )
         ** 2,
@@ -106,10 +111,10 @@ class _VectorizedKalmanFilter:
 
     P_mod = 1
 
-    w_s = np.sqrt(8)
-    w_d = 1
+    w_s = np.sqrt(2)
+    w_d = np.sqrt(0.5)
 
-    stop_speed_threshold = 0.5
+    stop_speed_threshold = 0.2
 
     def __init__(
         self,
@@ -119,6 +124,7 @@ class _VectorizedKalmanFilter:
         predict_mask: TensorType["time", "vehicle"] = None,
         inds: TensorType = None,
         gpu: bool = True,
+        init_vel: TensorType["vehicle"] = None,
     ) -> None:
         if z is None:
             self._device = pick_device(gpu=gpu)
@@ -179,9 +185,9 @@ class _VectorizedKalmanFilter:
             ).to(self._device)
         else:
             # this is for IMM filter, where predict_mask can be shared across filters
-            self._predict_mask: TensorType[
-                "time", "vehicle", "x_dim"
-            ] = predict_mask.to(self._device)
+            self._predict_mask: TensorType["time", "vehicle", "x_dim"] = (
+                predict_mask.to(self._device)
+            )
 
         # save the time differences
         if dt is None:
@@ -200,6 +206,16 @@ class _VectorizedKalmanFilter:
             (self.t_dim, self.v_dim, self.x_dim), device=self._device
         )
         self._x[0, :, :] = self._z[0] @ self._H
+        if init_vel is None:
+            self._x[0, :, 1] = (
+                torch.from_numpy(
+                    df.filter(pl.col("time_ind") == 0)["s_velocity"].to_numpy().copy()
+                )
+                .to(self._device)
+                .clone()
+            )
+        else:
+            self._x[0, :, 1] = init_vel.clone()
 
         # create P matrix
         self._P: TensorType["time", "vehicle", "x_dim", "x_dim"] = torch.zeros(
@@ -231,6 +247,7 @@ class _VectorizedKalmanFilter:
             dt=other_filter.dt,
             predict_mask=other_filter.predict_mask,
             inds=other_filter.inds,
+            init_vel=other_filter._x[0, :, 1],
         )
 
     @classmethod
@@ -268,8 +285,8 @@ class _VectorizedKalmanFilter:
         return self.Q_static(
             self._dt[t_ind],
             (self.v_dim, self.x_dim, self.x_dim),
-            self._z[t_ind, :, 0],  # speed info
-            self._predict_mask[t_ind],
+            self._z[t_ind, :, 1],  # speed info
+            mask=self._predict_mask[t_ind],
         ).to(self.device)
 
     @property
@@ -413,7 +430,7 @@ class _VectorizedKalmanFilter:
                 maha = ((U @ self._y[mask].unsqueeze(-1)).squeeze() ** 2).sum(axis=-1)
                 likelihood[mask] = -0.5 * (self._log2pi * rank + logdet + maha)
                 break
-            except RuntimeError as e:
+            except RuntimeError:
                 # find which vehicle is causing the problem
                 bad_inds = torch.where(
                     torch.any(
@@ -423,14 +440,6 @@ class _VectorizedKalmanFilter:
                         -2,
                     ).any(-1)
                 )[0]
-
-                # bad_veh = bad_inds[0]
-                # # the bad vehicle is the
-                # bad_veh_ind = torch.where(
-                #     bad_veh == (self._predict_mask[t_ind].cumsum(-1) - 1)
-                # )[0][0]
-                # print(f"bad vehicle: {bad_veh_ind}")
-                # print(f"bad filter: {self.__class__.__name__}")
 
                 # mask out the bad vehicle (return a large negative number so it doesn't get picked)
                 mask[bad_inds] = False
@@ -473,6 +482,11 @@ class _VectorizedKalmanFilter:
         if device is None:
             device = Xs.device
 
+        Ps = torch.clamp(
+            Ps,
+            min=1e-9,
+        )
+
         # smoother gain
         out_Xs = Xs.unsqueeze(-1).clone()
         for k in tqdm(range(n - 2, -1, -1)):
@@ -490,21 +504,24 @@ class _VectorizedKalmanFilter:
             # replace pinv with torch.linalg.lstsq(A, B).solution
             # K = torch.linalg.lstsq(Ps[k, mask] @ F_last.transpose(-1, -2), torch.eye(dim_x, device=device)).solution
 
-            K = (
-                Ps[k, mask]
-                @ F_last.transpose(-1, -2)
-                @ torch.linalg.pinv(Pp, hermitian=True)
-            )
+            try:
+                K = Ps[k, mask] @ F_last.transpose(-1, -2) @ Pp.pinverse()
 
+            except RuntimeError:
+                if Pp.isnan().all():
+                    # end of the line for k
+                    K = Ps[k, mask] @ F_last.transpose(-1, -2)
+            
             out_Xs[k, mask] += K @ (out_Xs[k + 1, mask] - F_last @ out_Xs[k, mask])
             Ps[k, mask] += K @ (Ps[k + 1, mask] - Pp) @ K.transpose(-1, -2)
 
         return out_Xs.squeeze(), Ps
 
 
+
 class CALKFilter(_VectorizedKalmanFilter):
     # w_s = 10
-    w_d = 5
+    # w_d = 5
 
     def __init__(
         self,
@@ -565,11 +582,11 @@ class CALKFilter(_VectorizedKalmanFilter):
             cls.w_d,
         )
 
-        # zero out the d_dot and dd_dot terms
-        Q[..., 4, :] = 0
-        Q[..., 5, :] = 0
-        Q[..., :, 4] = 0
-        Q[..., :, 5] = 0
+        # # zero out the d_dot and dd_dot terms
+        # Q[..., 4, :] = 0
+        # Q[..., 5, :] = 0
+        # Q[..., :, 4] = 0
+        # Q[..., :, 5] = 0
 
         return Q
 
@@ -606,7 +623,7 @@ class CALKFilter(_VectorizedKalmanFilter):
 
             Pp = F_last @ Ps[k, mask] @ F_last.transpose(-1, -2) + Q_last
 
-            K = Ps[k, mask] @ F_last.transpose(-1, -2) @ torch.linalg.pinv(Pp)
+            K = Ps[k, mask] @ F_last.transpose(-1, -2) @ Pp.inverse()
 
             out_Xs[k, mask] += K @ (out_Xs[k + 1, mask] - F_last @ out_Xs[k, mask])
             Ps[k, mask] += K @ (Ps[k + 1, mask] - Pp) @ K.transpose(-1, -2)
@@ -616,7 +633,7 @@ class CALKFilter(_VectorizedKalmanFilter):
 
 class CVLKFilter(_VectorizedKalmanFilter):
     # w_s = 10
-    w_d = 1
+    # w_d = 1
 
     def __init__(
         self,
@@ -670,20 +687,20 @@ class CVLKFilter(_VectorizedKalmanFilter):
             cls.w_d,
         )
 
-        # zero out the d_dot and dd_dot terms
-        Q[..., 2, :] = 0  # no acceleration
-        Q[..., :, 2] = 0  # no acceleration
+        # # zero out the d_dot and dd_dot terms
+        # Q[..., 2, :] = 0  # no acceleration
+        # Q[..., :, 2] = 0  # no acceleration
 
-        Q[..., 4, :] = 0
-        Q[..., 5, :] = 0
-        Q[..., :, 4] = 0
-        Q[..., :, 5] = 0
-        return Q @ Q.transpose(-1, -2)
+        # Q[..., 4, :] = 0
+        # Q[..., 5, :] = 0
+        # Q[..., :, 4] = 0
+        # Q[..., :, 5] = 0
+        return Q
 
 
 class CALCFilter(_VectorizedKalmanFilter):
     # w_s = 10
-    w_d = 1
+    # w_d = 1
 
     def __init__(
         self,
@@ -698,27 +715,32 @@ class CALCFilter(_VectorizedKalmanFilter):
 
     @staticmethod
     def F_static(
-        dt_vect: int, shape: Tuple[int, ...]
+        dt_vect: int, 
+        shape: Tuple[int, ...],
+        duplicate_pos_count: int = 1,
     ) -> TensorType["vehicle", "x_dim", "x_dim"]:
         F = torch.zeros(shape)
 
-        F[..., 0, 0] = 1
-        F[..., 0, 1] = dt_vect
-        F[..., 0, 2] = 0.5 * dt_vect**2
 
-        F[..., 1, 1] = 1
-        F[..., 1, 2] = dt_vect
+        for i in range(duplicate_pos_count):
 
-        F[..., 2, 2] = 1
+            F[..., i, i] = 1
+            F[..., i, (duplicate_pos_count - 1) + 1] = dt_vect
+            F[..., i, (duplicate_pos_count - 1) + 2] = 0.5 * dt_vect**2
 
-        F[..., 3, 3] = 1
-        F[..., 3, 4] = dt_vect
-        F[..., 3, 5] = 0.5 * dt_vect**2
+        F[..., i + 1, i + 1] = 1
+        F[..., i + 1, i + 2] = dt_vect
 
-        F[..., 4, 4] = 1
-        F[..., 4, 5] = dt_vect
+        F[..., i + 2, i + 2] = 1
 
-        F[..., 5, 5] = 1
+        F[..., i + 3, i + 3] = 1
+        F[..., i + 3, i + 4] = dt_vect
+        F[..., i + 3, i + 5] = 0.5 * dt_vect**2
+
+        F[..., i + 4, i + 4] = 1
+        F[..., i + 4, i + 5] = dt_vect
+
+        F[..., i + 5, i + 5] = 1
 
         return F
 
@@ -849,11 +871,11 @@ class IMMFilter:
             dtype=torch.bool,
         )
 
-        self._predict_mask[
-            self._filters[0].inds[:, 0], self._filters[0].inds[:, 1]
-        ] = torch.BoolTensor(
-            df["prediction"].to_numpy(writable=True).astype(np.bool_),
-        ).to(self._device)
+        self._predict_mask[self._filters[0].inds[:, 0], self._filters[0].inds[:, 1]] = (
+            torch.BoolTensor(
+                df["prediction"].to_numpy(writable=True).astype(np.bool_),
+            ).to(self._device)
+        )
 
         self._compute_state_estimate(0)
 
@@ -969,9 +991,9 @@ class IMMFilter:
             *self.update_vectorized(t_ind)
         ).exp()
 
-        likelihoods[
-            likelihoods <= torch.finfo(likelihoods.dtype).min
-        ] = torch.finfo().min
+        likelihoods[likelihoods <= torch.finfo(likelihoods.dtype).min] = (
+            torch.finfo().min
+        )
 
         # update the mode probabilities. This is the spot! where they get updated
         # so have to use the last time step
@@ -1009,10 +1031,11 @@ class IMMFilter:
         PHT = P @ H.transpose(-1, -2)
         S = H @ PHT + R
         try:
-            SI = torch.linalg.pinv(
-                S,
-                hermitian=True,
-            )
+            # SI = torch.linalg.pinv(
+            #     S,
+            #     # hermitian=True,
+            # )
+            SI = S.pinverse()
         except RuntimeError as e:
             print(f"pinverse failed at time {t_ind}")
             raise e
@@ -1042,7 +1065,7 @@ class IMMFilter:
         try:
             vals, vecs = torch.linalg.eigh(S)
         except RuntimeError as e:
-            print(f"eigh failed")
+            print("eigh failed")
             raise e
 
         logdet = torch.log(vals).sum(
@@ -1155,11 +1178,12 @@ def batch_imm_df(
         #     ).partition_by("chunk")
         # ):
         offset = chunk_df["vehicle_ind"].min()
+        chunk_df = chunk_df.with_columns(
+            (pl.col("vehicle_ind") - offset).alias("vehicle_ind")
+        )
 
         imm = IMMFilter(
-            chunk_df.with_columns(
-                (pl.col("vehicle_ind") - offset).alias("vehicle_ind")
-            ),
+            chunk_df,
             filters=filters,
             M=M,
             mu=mu,
@@ -1169,48 +1193,52 @@ def batch_imm_df(
         x_filt, p_filt = imm.apply_filter()
         mu_filt = imm._mu.cpu().numpy()
 
-        t_index = np.repeat(np.arange(imm.t_dim), imm.v_dim)
+        # t_index = np.repeat(np.arange(imm.t_dim), imm.v_dim)
         # v_index = np.tile(np.arange(imm.v_dim) + , imm.t_dim)
-        v_index = np.tile(np.arange(imm.v_dim), imm.t_dim) + offset
-        x_filt = x_filt.reshape(-1, imm.x_dim)
-        p_filt = p_filt.reshape(-1, imm.x_dim, imm.x_dim)
+        # v_index = np.tile(np.arange(imm.v_dim), imm.t_dim) + offset
+        # x_filt = x_filt.reshape(-1, imm.x_dim)
+        # p_filt = p_filt.reshape(-1, imm.x_dim, imm.x_dim)
         p_calc = (
             tuple(filter(lambda f: isinstance(f, CALCFilter), imm._filters))[0]
             .P
             # .detach()
             .cpu()
             .numpy()
-            .reshape(-1, imm.x_dim, imm.x_dim)
+            # .reshape(-1, imm.x_dim, imm.x_dim)
         )
-        mu_filt = mu_filt.reshape(-1, imm.f_dim)
+        # mu_filt = mu_filt.reshape(-1, imm.f_dim)
+
+        res_df = chunk_df.select(["time_ind", "vehicle_ind"]).clone()
+
+        x_filt = x_filt[res_df["time_ind"], res_df["vehicle_ind"]]
+        p_filt = p_filt[res_df["time_ind"], res_df["vehicle_ind"]]
+        p_calc = p_calc[res_df["time_ind"], res_df["vehicle_ind"]]
+        mu_filt = mu_filt[res_df["time_ind"], res_df["vehicle_ind"]]
+
         filts.append(
-            pl.DataFrame(
-                {
-                    "time_ind": t_index,
-                    "vehicle_ind": v_index,
-                    "s": x_filt[:, 0],
-                    "s_velocity": x_filt[:, 1],
-                    "s_accel": x_filt[:, 2],
-                    "d": x_filt[:, 3],
-                    "d_velocity": x_filt[:, 4],
-                    "d_accel": x_filt[:, 5],
-                    "P": pa.FixedSizeListArray.from_arrays(
+            res_df.with_columns(
+                s=pl.Series(x_filt[:, 0]),
+                s_velocity=pl.Series(x_filt[:, 1]),
+                s_accel=pl.Series(x_filt[:, 2]),
+                d=pl.Series(x_filt[:, 3]),
+                d_velocity=pl.Series(x_filt[:, 4]),
+                d_accel=pl.Series(x_filt[:, 5]),
+                P=pl.Series(
+                    pa.FixedSizeListArray.from_arrays(
                         p_filt.reshape(-1), imm.x_dim * imm.x_dim
-                    ),
-                    "P_CALC": pa.FixedSizeListArray.from_arrays(
+                    )
+                ),
+                P_CALC=pl.Series(
+                    pa.FixedSizeListArray.from_arrays(
                         p_calc.reshape(-1), imm.x_dim * imm.x_dim
-                    ),
-                    **{
-                        f"mu_{f}": mu_filt[:, i]
-                        for i, f in enumerate(filt.upper() for filt in filters)
-                    },
-                }
-            ).with_columns(
-                [
-                    pl.col("time_ind").cast(pl.Int32),
-                    pl.col("vehicle_ind").cast(pl.Int32),
-                ]
+                    )
+                ),
             )
+            .with_columns(
+                pl.Series(mu_filt[:, i]).alias(f"mu_{f}")
+                for i, f in enumerate(filt.upper() for filt in filters)
+            )
+            .with_columns(pl.col("vehicle_ind") + offset)
         )
 
         imm.cleanup()
