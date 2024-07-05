@@ -2,14 +2,6 @@
 
 This is code to accompany the paper <TODO>
 
-## Internal
-
-- [ ] Add a link to the paper
-- [ ] Raw data currently stored in `DOECV2X/Working_Papers/radar-trajectory-extraction/raw_data/`
-- [ ] Cached data currently stored in `/media/HDD/max/radar-data/<month>/cache`
-- [ ] Create a dataset description
-- [ ] Create a demo dataset
-- [ ] Add speed back to the small dataset
 
 ## Installation
 
